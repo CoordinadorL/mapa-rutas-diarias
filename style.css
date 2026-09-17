@@ -1,0 +1,110 @@
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: Arial, Helvetica, sans-serif;
+  background: #f2f2f2;
+}
+
+#barra-superior {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #1b5e20;
+  color: #fff;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.25);
+}
+
+#titulo {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+#fecha-ruta {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+#selector-camion {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  font-size: 15px;
+  border-radius: 6px;
+  border: none;
+}
+
+#resumen-camion {
+  position: fixed;
+  top: 56px;
+  left: 0;
+  right: 0;
+  z-index: 999;
+  background: #e8f5e9;
+  color: #1b5e20;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-bottom: 1px solid #c8e6c9;
+  display: none;
+}
+
+#mapa {
+  position: absolute;
+  top: 56px;
+  bottom: 0;
+  left: 0;
+  right: 0;
+}
+
+#resumen-camion.visible ~ #mapa {
+  top: 84px;
+}
+
+#estado-carga {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1001;
+  background: #fff;
+  padding: 12px 18px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  font-size: 14px;
+  color: #333;
+}
+
+#estado-carga.oculto {
+  display: none;
+}
+
+.popup-cliente {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.popup-cliente b {
+  font-size: 14px;
+}
+
+.popup-cliente .canal {
+  color: #555;
+  font-style: italic;
+}
+
+.popup-cliente .venta {
+  margin-top: 4px;
+  font-weight: bold;
+  color: #1b5e20;
+}

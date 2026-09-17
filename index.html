@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Mapa de Rutas Diarias</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="barra-superior">
+  <div id="titulo">
+    <strong>Rutas Diarias</strong>
+    <span id="fecha-ruta">--</span>
+  </div>
+  <select id="selector-camion">
+    <option value="">Cargando...</option>
+  </select>
+</div>
+
+<div id="resumen-camion"></div>
+
+<div id="mapa"></div>
+
+<div id="estado-carga">Cargando ruta del dia...</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

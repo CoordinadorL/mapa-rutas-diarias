@@ -11,7 +11,7 @@ if "%CARPETA%"=="" (
 python "%~dp0convertir.py" "%CARPETA%"
 
 echo.
-echo Listo: data\latest.json actualizado (no se sube a git, ver README.md
-echo para como entregarlo sin exponer datos de clientes).
+echo Listo: data\latest.json actualizado.
+echo Ahora corre publicar_datos.bat para que los choferes vean la ruta.
 echo.
 pause

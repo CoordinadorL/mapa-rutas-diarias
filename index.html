@@ -25,6 +25,16 @@
 
 <div id="estado-carga">Cargando ruta del dia...</div>
 
+<div id="pantalla-codigo" class="oculto">
+  <div id="caja-codigo">
+    <strong>Codigo de acceso</strong>
+    <p>Pide el codigo al encargado de rutas (es el mismo para todos los choferes).</p>
+    <input type="password" id="input-codigo" autocomplete="off" placeholder="Pega aqui el codigo">
+    <button id="boton-codigo">Entrar</button>
+    <p id="error-codigo" class="oculto">Codigo incorrecto o vencido, intenta de nuevo.</p>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="app.js"></script>
 </body>

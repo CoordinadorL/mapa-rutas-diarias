@@ -4,62 +4,63 @@ Reemplazo liviano de Google My Maps para publicar la ruta diaria de cada camión
 Usa OpenStreetMap + Leaflet en vez de Google Maps, así que consume muchos menos
 datos móviles al abrirlo — importante para los choferes que no tienen plan de datos.
 
-## ⚠️ Pendiente: cómo va a llegar `data/latest.json` a los choferes
+- **Sitio publicado**: https://coordinadorl.github.io/mapa-rutas-diarias/
+- **Repo de este sitio** (público, sin datos de clientes): `mapa-rutas-diarias`
+- **Repo de datos** (privado, con clientes/direcciones/ventas reales): `mapa-rutas-datos`
 
-Este repo es **público** (para que GitHub Pages sea gratis), y `data/latest.json`
-trae nombres, direcciones y ventas de clientes reales. Por eso **no se sube a
-git** (está en `.gitignore`) — si se sube, cualquier persona en internet podría
-verlo.
+## Por qué dos repos
 
-Eso significa que, tal como está ahora, el sitio publicado en GitHub Pages
-**no va a tener datos** (mostrará el error "no se pudo cargar la ruta del día"),
-porque el archivo que los contiene nunca llega al repo público. Falta decidir
-cómo se entrega ese archivo a diario sin exponerlo, por ejemplo:
+Este repo (`mapa-rutas-diarias`) es **público** para que GitHub Pages sea
+gratis, así que no puede tener datos reales de clientes. Esos datos viven en
+`mapa-rutas-datos`, que es **privado**. El mapa público los lee usando un
+"código de acceso" (un token de solo lectura de ese repo privado) que cada
+chofer pega una sola vez en su celular — ver [TOKEN.md](TOKEN.md) para
+generarlo y repartirlo.
 
-- Un repo **privado** aparte solo para `data/latest.json`, y que `app.js` lo
-  lea desde ahí (requiere que ese repo/host sí soporte acceso privado).
-- Guardarlo en un Google Drive/OneDrive con link no listado y que `app.js`
-  lo lea de ahí en vez de `data/latest.json`.
-- Pasar `data/latest.json` a los choferes de otra forma (ej. adjunto en el
-  grupo de WhatsApp del turno) en vez de servirlo desde la página.
-
-Cuando se decida, hay que ajustar la URL del `fetch(...)` en `app.js`.
-
-## Cómo se usa cada día (una vez resuelto lo anterior)
+## Cómo se usa cada día
 
 1. Genera los archivos `MAPA F1xx.xlsx` de siempre en la carpeta del día
    (ej: `C:\RUTAS DIARIAS\15MARTES 15`), igual que hasta ahora para Google My Maps.
 2. Arrastra esa carpeta sobre `actualizar_ruta.bat` (o ejecútalo y pega la ruta
-   cuando la pida). Esto genera `data/latest.json` con los datos del día
-   (queda solo en tu computadora, no se sube a este repo).
-3. Entrega ese archivo a donde corresponda según lo que se haya definido arriba.
-4. Los choferes abren siempre el mismo link (la página publicada en GitHub
-   Pages) y ven la ruta actualizada, sin tener que instalar ni configurar nada.
+   cuando la pida). Esto genera `data/latest.json` local con los datos del día.
+3. Corre `publicar_datos.bat`. Copia ese archivo al repo privado
+   `mapa-rutas-datos` y lo sube.
+4. Los choferes abren siempre el mismo link (arriba) y ven la ruta
+   actualizada, sin instalar ni configurar nada (salvo pegar el código de
+   acceso la primera vez).
 
-También se puede correr directo:
+También se puede correr todo a mano:
 ```
 python convertir.py "C:\RUTAS DIARIAS\15MARTES 15"
 ```
 
 ## Estructura del proyecto
 
-- `index.html`, `app.js`, `style.css` — el visor del mapa (selector de camión + mapa).
+- `index.html`, `app.js`, `style.css` — el visor del mapa (selector de camión,
+  mapa, pantalla de código de acceso).
 - `convertir.py` — convierte los `MAPA F1xx.xlsx` del día a `data/latest.json`.
-- `data/latest.json` — datos del día actual (se sobrescribe cada vez que se corre el
-  conversor). **No está en git** porque trae datos reales de clientes; ver la
-  sección de arriba.
-- `actualizar_ruta.bat` — atajo para no tener que escribir el comando de Python.
+- `data/latest.json` — datos del día actual, solo en esta computadora
+  (está en `.gitignore`, nunca se sube a este repo público).
+- `actualizar_ruta.bat` — genera `data/latest.json` desde la carpeta del día.
+- `publicar_datos.bat` — sube ese archivo al repo privado `mapa-rutas-datos`.
+- `TOKEN.md` — cómo generar y repartir el código de acceso.
 
-## Probar en local antes de publicar
+El repo privado `mapa-rutas-datos` es una carpeta aparte en
+`C:\MAPA-RUTAS-DATOS` (clon de ese repo); `publicar_datos.bat` ya sabe copiar
+ahí el archivo y subirlo.
+
+## Probar en local
 
 ```
 python -m http.server 8532
 ```
-y abrir `http://localhost:8532` en el navegador.
+y abrir `http://localhost:8532` en el navegador. Sin código de acceso válido
+va a mostrar la pantalla para pedirlo (es normal, esa parte solo funciona con
+un código real generado según TOKEN.md).
 
-## Publicar en GitHub Pages
+## Publicar en GitHub Pages (ya hecho para este repo)
 
 1. Crear el repositorio en GitHub y hacer push de esta carpeta.
 2. En **Settings → Pages**, elegir la rama `main` y carpeta raíz (`/`).
-3. GitHub entrega un link fijo (tipo `https://usuario.github.io/mapa-rutas/`)
-   que es el que se comparte con los choferes.
+3. GitHub entrega un link fijo (`https://usuario.github.io/repo/`) que es el
+   que se comparte con los choferes.

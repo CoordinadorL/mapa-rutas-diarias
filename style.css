@@ -108,3 +108,62 @@ html, body {
   font-weight: bold;
   color: #1b5e20;
 }
+
+#pantalla-codigo {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+#pantalla-codigo.oculto {
+  display: none;
+}
+
+#caja-codigo {
+  background: #fff;
+  border-radius: 10px;
+  padding: 20px;
+  max-width: 320px;
+  width: 100%;
+  text-align: center;
+}
+
+#caja-codigo p {
+  font-size: 13px;
+  color: #555;
+  margin: 8px 0 14px;
+}
+
+#input-codigo {
+  width: 100%;
+  padding: 10px;
+  font-size: 15px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+
+#boton-codigo {
+  width: 100%;
+  padding: 10px;
+  font-size: 15px;
+  background: #1b5e20;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+}
+
+#error-codigo {
+  color: #c62828;
+  font-size: 13px;
+  margin-top: 10px;
+}
+
+#error-codigo.oculto {
+  display: none;
+}

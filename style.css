@@ -45,12 +45,15 @@ html, body {
   border: none;
 }
 
-#resumen-camion {
+#info-superior {
   position: fixed;
-  top: 56px;
   left: 0;
   right: 0;
   z-index: 999;
+  top: 56px; /* se recalcula por JS segun el alto real de la barra */
+}
+
+#resumen-camion {
   background: #e8f5e9;
   color: #1b5e20;
   font-size: 13px;
@@ -59,16 +62,41 @@ html, body {
   display: none;
 }
 
+#leyenda-colores {
+  background: #fff;
+  padding: 6px 12px;
+  border-bottom: 1px solid #ddd;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+#leyenda-colores.oculto {
+  display: none;
+}
+
+.chip-vendedor {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: #333;
+}
+
+.chip-vendedor i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid rgba(0,0,0,0.3);
+}
+
 #mapa {
-  position: absolute;
-  top: 56px;
+  position: fixed;
+  top: 56px; /* se recalcula por JS segun el alto real de barra + info */
   bottom: 0;
   left: 0;
   right: 0;
-}
-
-#resumen-camion.visible ~ #mapa {
-  top: 84px;
 }
 
 #estado-carga {
@@ -107,6 +135,59 @@ html, body {
   margin-top: 4px;
   font-weight: bold;
   color: #1b5e20;
+}
+
+.popup-cliente .ayuda-admin {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #b45309;
+  font-style: italic;
+}
+
+.marcador-color span {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 3px rgba(0, 0, 0, 0.7);
+}
+
+#badge-admin {
+  background: #f9a825;
+  color: #000;
+  font-size: 10px;
+  font-weight: bold;
+  padding: 1px 6px;
+  border-radius: 10px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+#badge-admin.oculto {
+  display: none;
+}
+
+#estado-guardado {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1500;
+  background: #1b5e20;
+  color: #fff;
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-size: 13px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+
+#estado-guardado.error {
+  background: #c62828;
+}
+
+#estado-guardado.oculto {
+  display: none;
 }
 
 #pantalla-codigo {

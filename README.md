@@ -13,9 +13,30 @@ datos móviles al abrirlo — importante para los choferes que no tienen plan de
 Este repo (`mapa-rutas-diarias`) es **público** para que GitHub Pages sea
 gratis, así que no puede tener datos reales de clientes. Esos datos viven en
 `mapa-rutas-datos`, que es **privado**. El mapa público los lee usando un
-"código de acceso" (un token de solo lectura de ese repo privado) que cada
-chofer pega una sola vez en su celular — ver [TOKEN.md](TOKEN.md) para
-generarlo y repartirlo.
+"código de acceso" (un token de ese repo privado) — ver [TOKEN.md](TOKEN.md)
+para generarlo y repartirlo.
+
+## Choferes vs. administrador
+
+Hay dos niveles de acceso, cada uno con su propio código (ver TOKEN.md):
+
+- **Chofer**: solo ve el mapa y los clientes de su camión. No puede editar nada.
+- **Administrador** (vos): además de ver el mapa, podés **arrastrar un punto**
+  para corregir la ubicación de un cliente. Se guarda solo (abajo aparece
+  "Ubicacion guardada") y desde ese momento todos los choferes ven el punto
+  ya corregido — sin que tengan que hacer nada de su lado.
+
+Para no tener que pegar el código a mano en cada celular (es largo), se
+reparte como un **link** que ya lo trae incluido — ver la sección
+"Como armar los links" en [TOKEN.md](TOKEN.md).
+
+## Colores por vendedor
+
+Dentro de cada camión, los clientes se pintan de un color distinto según su
+código de vendedor (siempre colores bien diferenciables entre sí — nunca dos
+tonos parecidos en el mismo camión). Si un camión tiene más de un vendedor,
+aparece una leyenda de colores debajo del resumen. Los colores se pueden
+repetir de un camión a otro, pero nunca dentro del mismo.
 
 ## Cómo se usa cada día
 
@@ -47,7 +68,9 @@ python convertir.py "C:\RUTAS DIARIAS\15MARTES 15"
 
 El repo privado `mapa-rutas-datos` es una carpeta aparte en
 `C:\MAPA-RUTAS-DATOS` (clon de ese repo); `publicar_datos.bat` ya sabe copiar
-ahí el archivo y subirlo.
+ahí el archivo y subirlo. Ese mismo repo privado también guarda
+`overrides.json`, que crea y actualiza el mapa solo cuando el administrador
+corrige la ubicación de un cliente (no hace falta tocarlo a mano).
 
 ## Probar en local
 

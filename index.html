@@ -11,7 +11,7 @@
 
 <div id="barra-superior">
   <div id="titulo">
-    <strong>Rutas Diarias</strong>
+    <strong>Rutas Diarias <span id="badge-admin" class="oculto">ADMIN</span></strong>
     <span id="fecha-ruta">--</span>
   </div>
   <select id="selector-camion">
@@ -19,16 +19,22 @@
   </select>
 </div>
 
-<div id="resumen-camion"></div>
+<div id="info-superior">
+  <div id="resumen-camion"></div>
+  <div id="leyenda-colores"></div>
+</div>
 
 <div id="mapa"></div>
 
 <div id="estado-carga">Cargando ruta del dia...</div>
 
+<div id="estado-guardado" class="oculto"></div>
+
 <div id="pantalla-codigo" class="oculto">
   <div id="caja-codigo">
     <strong>Codigo de acceso</strong>
-    <p>Pide el codigo al encargado de rutas (es el mismo para todos los choferes).</p>
+    <p>Si el encargado te mando un link, abrelo y esto no deberia aparecer.
+       Si te dio el codigo directo, pegalo aqui (una sola vez).</p>
     <input type="password" id="input-codigo" autocomplete="off" placeholder="Pega aqui el codigo">
     <button id="boton-codigo">Entrar</button>
     <p id="error-codigo" class="oculto">Codigo incorrecto o vencido, intenta de nuevo.</p>

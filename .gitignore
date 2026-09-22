@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 data/latest.json
+
+# Notas con codigos/tokens: nunca deben subirse a este repo publico.
+DATOS DE GITHUB.txt
+*.txt

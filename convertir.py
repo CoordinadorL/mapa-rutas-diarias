@@ -24,6 +24,31 @@ COLUMNAS_ESPERADAS = [
 
 NOMBRE_MASTER = "RUTAS DIARIAS CAMIONES - MY MAPS.xlsx"
 
+# Colores bien distinguibles entre si (nada de celeste+azul+gris juntos).
+# Se asignan por vendedor DENTRO de cada camion, en orden de aparicion, asi
+# que se pueden repetir de un camion a otro pero nunca dentro del mismo.
+PALETA_COLORES = [
+    "#e6194B",  # rojo
+    "#4363d8",  # azul
+    "#3cb44b",  # verde
+    "#f58231",  # naranja
+    "#911eb4",  # morado
+    "#000000",  # negro
+    "#f032e6",  # magenta
+    "#9A6324",  # cafe
+    "#800000",  # guinda
+    "#bfef45",  # verde lima
+]
+
+
+def asignar_colores(clientes) -> None:
+    color_por_vendedor = {}
+    for cliente in clientes:
+        vendedor = cliente.get("vendedor") or "SIN-VENDEDOR"
+        if vendedor not in color_por_vendedor:
+            color_por_vendedor[vendedor] = PALETA_COLORES[len(color_por_vendedor) % len(PALETA_COLORES)]
+        cliente["color"] = color_por_vendedor[vendedor]
+
 
 def id_camion_desde_archivo(nombre_archivo: str) -> str:
     nombre = nombre_archivo.replace(".xlsx", "")
@@ -70,6 +95,7 @@ def leer_archivo_camion(ruta: Path):
             "nombre": (fila[idx["Razon"]] or "").strip(),
             "direccion": (fila[idx["Direccion"]] or "").strip(),
             "canal": (fila[idx["canal"]] or "").strip(),
+            "vendedor": (fila[idx["vendedor"]] or "").strip(),
             "lat": float(lat),
             "lng": float(lng),
             "peso": fila[idx["Suma de Peso"]],
@@ -79,6 +105,8 @@ def leer_archivo_camion(ruta: Path):
 
     if not clientes:
         return None
+
+    asignar_colores(clientes)
 
     return {
         "id": id_camion_desde_archivo(ruta.name),

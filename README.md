@@ -81,6 +81,13 @@ y abrir `http://localhost:8532` en el navegador. Sin código de acceso válido
 va a mostrar la pantalla para pedirlo (es normal, esa parte solo funciona con
 un código real generado según TOKEN.md).
 
+## Si cambias `app.js` o `style.css`
+
+Los celulares los guardan en caché, así que un cambio puede tardar en
+notarse. Sube el cambio subiendo también el número en
+`index.html` (`app.js?v=2` → `?v=3`, etc.) para forzar que se note la
+actualización.
+
 ## Publicar en GitHub Pages (ya hecho para este repo)
 
 1. Crear el repositorio en GitHub y hacer push de esta carpeta.

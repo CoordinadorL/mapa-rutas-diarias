@@ -4,13 +4,13 @@
 // IMPORTANTE: cuando cambies app.js o style.css, sube este numero de
 // version (ademas del ?v= en index.html) para que el celular note el
 // cambio en vez de seguir usando la copia guardada.
-var CACHE_VERSION = "mrd-v2";
+var CACHE_VERSION = "mrd-v3";
 
 var APP_SHELL = [
   "./",
   "./index.html",
-  "./style.css?v=6",
-  "./app.js?v=6",
+  "./style.css?v=7",
+  "./app.js?v=7",
   "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js",
   "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css",
   "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png",

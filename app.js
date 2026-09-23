@@ -24,6 +24,68 @@
 
   mapa.on("zoomend", actualizarEtiquetas);
 
+  // Boton "Mi ubicacion": muestra un punto azul con la posicion del chofer
+  // y lo mantiene actualizado mientras este activado (para ver que tan
+  // cerca esta de las proximas paradas). Nunca se manda a ningun lado,
+  // solo se dibuja en el mapa de este celular.
+  var marcadorYo = null;
+  var idVigilarUbicacion = null;
+
+  var ControlUbicacion = L.Control.extend({
+    options: { position: "topleft" },
+    onAdd: function () {
+      var contenedor = L.DomUtil.create("div", "leaflet-bar control-ubicacion");
+      var boton = L.DomUtil.create("a", "", contenedor);
+      boton.href = "#";
+      boton.title = "Mostrar mi ubicacion";
+      boton.innerHTML = "📍";
+      L.DomEvent.on(boton, "click", function (e) {
+        L.DomEvent.stop(e);
+        alternarMiUbicacion();
+      });
+      return contenedor;
+    },
+  });
+
+  mapa.addControl(new ControlUbicacion());
+
+  function alternarMiUbicacion() {
+    if (idVigilarUbicacion !== null) {
+      navigator.geolocation.clearWatch(idVigilarUbicacion);
+      idVigilarUbicacion = null;
+      if (marcadorYo) {
+        mapa.removeLayer(marcadorYo);
+        marcadorYo = null;
+      }
+      return;
+    }
+
+    if (!("geolocation" in navigator)) {
+      mostrarEstadoGuardado("Este celular no puede compartir su ubicacion", true);
+      return;
+    }
+
+    idVigilarUbicacion = navigator.geolocation.watchPosition(
+      function (posicion) {
+        var pos = [posicion.coords.latitude, posicion.coords.longitude];
+        if (!marcadorYo) {
+          marcadorYo = L.marker(pos, {
+            icon: L.divIcon({ className: "marcador-yo-wrap", html: '<span class="marcador-yo"></span>', iconSize: [16, 16], iconAnchor: [8, 8] }),
+            zIndexOffset: 1000,
+          }).addTo(mapa);
+          mapa.setView(pos, Math.max(mapa.getZoom(), 15));
+        } else {
+          marcadorYo.setLatLng(pos);
+        }
+      },
+      function () {
+        mostrarEstadoGuardado("No se pudo obtener tu ubicacion", true);
+        idVigilarUbicacion = null;
+      },
+      { enableHighAccuracy: true, maximumAge: 5000 }
+    );
+  }
+
   var barraSuperiorEl = document.getElementById("barra-superior");
   var infoSuperiorEl = document.getElementById("info-superior");
   var mapaEl = document.getElementById("mapa");
@@ -48,8 +110,16 @@
   var resultadoQrEl = document.getElementById("resultado-qr");
   var qrImagenEl = document.getElementById("qr-imagen");
   var descargarQrEl = document.getElementById("descargar-qr");
+  var botonBuscarEl = document.getElementById("boton-buscar");
+  var panelBuscarEl = document.getElementById("panel-buscar");
+  var cerrarBuscarEl = document.getElementById("cerrar-buscar");
+  var inputBuscarEl = document.getElementById("input-buscar");
+  var resultadosBuscarEl = document.getElementById("resultados-buscar");
   var datos = null;
   var overrides = {};
+  var camionActual = null;
+  var marcadoresPorCodigo = {};
+  var entregados = {};
 
   // El mapa (index.html/app.js) es publico. Los datos reales de clientes
   // viven en un repo PRIVADO aparte (mapa-rutas-datos) para no exponerlos.
@@ -215,14 +285,42 @@
     return "$" + valor.toFixed(2);
   }
 
-  function iconoColor(color) {
+  function iconoColor(color, entregado) {
     return L.divIcon({
-      className: "marcador-color",
-      html: '<span style="background:' + color + '"></span>',
+      className: "marcador-color" + (entregado ? " entregado" : ""),
+      html:
+        '<span style="background:' + color + '"></span>' +
+        (entregado ? '<i class="check-entregado">&#10003;</i>' : ""),
       iconSize: [18, 18],
       iconAnchor: [9, 9],
       popupAnchor: [0, -10],
     });
+  }
+
+  // "Marcar entregado" queda solo en el celular de cada quien (no se manda a
+  // ningun repo): es para que el chofer no pierda la cuenta de a quien ya le
+  // dejo el pedido. Se reinicia solo cada dia, junto con la ruta nueva.
+  function claveEntregados() {
+    return "mrd_entregados_" + (datos ? datos.fecha : "");
+  }
+
+  function cargarEntregados() {
+    try {
+      return JSON.parse(localStorage.getItem(claveEntregados()) || "{}");
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function marcarEntregado(codigo, entregado) {
+    if (entregado) {
+      entregados[codigo] = true;
+    } else {
+      delete entregados[codigo];
+    }
+    try {
+      localStorage.setItem(claveEntregados(), JSON.stringify(entregados));
+    } catch (e) {}
   }
 
   function mostrarEstadoGuardado(texto, esError) {
@@ -277,18 +375,42 @@
     return ajuste ? [ajuste.lat, ajuste.lng] : [cliente.lat, cliente.lng];
   }
 
+  function actualizarResumen(camion) {
+    var totalVenta = camion.clientes.reduce(function (acc, c) { return acc + (c.venta || 0); }, 0);
+    var totalEntregados = camion.clientes.reduce(function (acc, c) {
+      return acc + (entregados[c.codigo] ? 1 : 0);
+    }, 0);
+
+    resumenEl.textContent =
+      camion.clientes.length + " clientes" +
+      (totalEntregados ? " · " + totalEntregados + " entregados" : "") +
+      (camion.chofer ? " · " + camion.chofer : "") +
+      (totalVenta ? " · " + formatoMoneda(totalVenta) : "");
+    resumenEl.classList.add("visible");
+  }
+
+  function actualizarEstiloEntregado(marcador, cliente, entregado) {
+    marcador.setIcon(iconoColor(cliente.color || "#4363d8", entregado));
+    marcador.setTooltipContent((entregado ? "✓ " : "") + cliente.nombre);
+  }
+
   function pintarCamion(idCamion, esAdmin, tokenAdmin) {
     capaMarcadores.clearLayers();
 
     var camion = datos.camiones.find(function (c) { return c.id === idCamion; });
     if (!camion) return;
 
+    camionActual = camion;
+    marcadoresPorCodigo = {};
+    entregados = cargarEntregados();
+
     var puntos = [];
 
     camion.clientes.forEach(function (cliente, i) {
       var pos = posicionCliente(cliente);
+      var estaEntregado = !!entregados[cliente.codigo];
       var marcador = L.marker(pos, {
-        icon: iconoColor(cliente.color || "#4363d8"),
+        icon: iconoColor(cliente.color || "#4363d8", estaEntregado),
         draggable: !!esAdmin,
       }).addTo(capaMarcadores);
 
@@ -302,15 +424,32 @@
         '<a class="btn-navegar btn-maps" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=' + pos[0] + "," + pos[1] + '">Maps</a>' +
         '<a class="btn-navegar btn-waze" target="_blank" rel="noopener" href="https://waze.com/ul?ll=' + pos[0] + "," + pos[1] + '&navigate=yes">Waze</a>' +
         "</div>" +
+        '<button type="button" class="btn-entregado' + (estaEntregado ? " hecho" : "") + '">' +
+        (estaEntregado ? "↺ Deshacer entrega" : "✓ Marcar entregado") +
+        "</button>" +
         (esAdmin ? '<div class="ayuda-admin">Arrastra el punto para corregir la ubicacion</div>' : "") +
         "</div>";
       marcador.bindPopup(html);
 
-      marcador.bindTooltip(cliente.nombre, {
+      marcador.bindTooltip((estaEntregado ? "✓ " : "") + cliente.nombre, {
         permanent: true,
         direction: "top",
         offset: [0, -8],
         className: "etiqueta-cliente",
+      });
+
+      marcador.on("popupopen", function () {
+        var el = marcador.getPopup().getElement();
+        var boton = el && el.querySelector(".btn-entregado");
+        if (!boton) return;
+        boton.onclick = function () {
+          var nuevoEstado = !entregados[cliente.codigo];
+          marcarEntregado(cliente.codigo, nuevoEstado);
+          actualizarEstiloEntregado(marcador, cliente, nuevoEstado);
+          boton.textContent = nuevoEstado ? "↺ Deshacer entrega" : "✓ Marcar entregado";
+          boton.classList.toggle("hecho", nuevoEstado);
+          actualizarResumen(camion);
+        };
       });
 
       if (esAdmin) {
@@ -320,6 +459,7 @@
         });
       }
 
+      marcadoresPorCodigo[cliente.codigo] = marcador;
       puntos.push(pos);
     });
 
@@ -327,13 +467,7 @@
       mapa.fitBounds(puntos, { padding: [30, 30] });
     }
     actualizarEtiquetas();
-
-    var totalVenta = camion.clientes.reduce(function (acc, c) { return acc + (c.venta || 0); }, 0);
-    resumenEl.textContent =
-      camion.clientes.length + " clientes" +
-      (camion.chofer ? " · " + camion.chofer : "") +
-      (totalVenta ? " · " + formatoMoneda(totalVenta) : "");
-    resumenEl.classList.add("visible");
+    actualizarResumen(camion);
     resumenEl.style.display = "block";
 
     pintarLeyenda(camion);
@@ -394,6 +528,53 @@
     generarWhatsappEl.disabled = !hayCodigo;
     generarQrEl.disabled = !hayCodigo;
   }
+
+  function pintarResultadosBuscar(texto) {
+    if (!camionActual) return;
+
+    var filtro = texto.trim().toUpperCase();
+    var clientes = camionActual.clientes.filter(function (c) {
+      return !filtro || c.nombre.toUpperCase().indexOf(filtro) !== -1;
+    });
+
+    if (!clientes.length) {
+      resultadosBuscarEl.innerHTML = '<p class="sin-resultados">No se encontro ningun cliente.</p>';
+      return;
+    }
+
+    resultadosBuscarEl.innerHTML = clientes.map(function (c) {
+      return '<button type="button" class="resultado-cliente" data-codigo="' + escaparHtml(String(c.codigo)) + '">' +
+        escaparHtml(c.nombre) +
+        '<span class="direccion-resultado">' + escaparHtml(c.direccion) + "</span>" +
+        "</button>";
+    }).join("");
+
+    Array.prototype.forEach.call(resultadosBuscarEl.querySelectorAll(".resultado-cliente"), function (boton) {
+      boton.addEventListener("click", function () {
+        var codigo = boton.getAttribute("data-codigo");
+        var marcador = marcadoresPorCodigo[codigo];
+        if (!marcador) return;
+        panelBuscarEl.classList.add("oculto");
+        mapa.setView(marcador.getLatLng(), 18);
+        setTimeout(function () { marcador.openPopup(); }, 300);
+      });
+    });
+  }
+
+  botonBuscarEl.addEventListener("click", function () {
+    inputBuscarEl.value = "";
+    pintarResultadosBuscar("");
+    panelBuscarEl.classList.remove("oculto");
+    inputBuscarEl.focus();
+  });
+
+  cerrarBuscarEl.addEventListener("click", function () {
+    panelBuscarEl.classList.add("oculto");
+  });
+
+  inputBuscarEl.addEventListener("input", function () {
+    pintarResultadosBuscar(inputBuscarEl.value);
+  });
 
   botonCompartirEl.addEventListener("click", function () {
     inputCodigoCompartirEl.value = leerStorage(CLAVE_CODIGO_COMPARTIR);

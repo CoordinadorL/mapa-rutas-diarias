@@ -53,6 +53,20 @@ en el celular). Además, al acercar bastante el zoom aparece el nombre de
 cada cliente al lado del punto (como en My Maps); al alejar, se ocultan
 solas para no saturar el mapa.
 
+## Para el chofer en la calle
+
+- **Buscar cliente** (🔍 abajo a la izquierda): filtra por nombre dentro del
+  camión seleccionado y al tocar un resultado salta directo a ese punto y
+  abre su popup.
+- **Mi ubicación** (📍 arriba a la izquierda, junto al zoom): muestra un
+  punto azul con la posición del celular, para ver qué tan cerca está de
+  las próximas paradas. Nunca se manda a ningún lado, solo se dibuja en
+  ese celular.
+- **Marcar entregado**: botón dentro del popup de cada cliente. El punto
+  queda atenuado con una palomita, y arriba se cuenta cuántos van
+  entregados. Se guarda solo en el celular de quien lo marca y se
+  reinicia solo al otro día con la ruta nueva (no se sube a ningún repo).
+
 ## Modo sin conexión
 
 El sitio guarda en el celular (service worker, `sw.js`) el mapa base y las

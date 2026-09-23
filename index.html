@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Mapa de Rutas Diarias</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-<link rel="stylesheet" href="style.css?v=6">
+<link rel="stylesheet" href="style.css?v=7">
 </head>
 <body>
 
@@ -41,6 +41,16 @@
   </div>
 </div>
 
+<button id="boton-buscar" aria-label="Buscar cliente">🔍</button>
+
+<div id="panel-buscar" class="oculto">
+  <div id="caja-buscar">
+    <button id="cerrar-buscar" aria-label="Cerrar">&times;</button>
+    <input type="text" id="input-buscar" autocomplete="off" placeholder="Buscar cliente por nombre...">
+    <div id="resultados-buscar"></div>
+  </div>
+</div>
+
 <button id="boton-compartir" class="oculto">Compartir con choferes</button>
 
 <div id="panel-compartir" class="oculto">
@@ -67,6 +77,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="app.js?v=6"></script>
+<script src="app.js?v=7"></script>
 </body>
 </html>

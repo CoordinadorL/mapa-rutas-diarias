@@ -433,3 +433,151 @@ html, body {
   font-size: 13px;
   color: #1b5e20;
 }
+
+#boton-buscar {
+  position: fixed;
+  left: 16px;
+  bottom: 20px;
+  z-index: 1400;
+  background: #fff;
+  color: #1b5e20;
+  border: none;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  font-size: 18px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+}
+
+#panel-buscar {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 20px;
+}
+
+#panel-buscar.oculto {
+  display: none;
+}
+
+#caja-buscar {
+  position: relative;
+  background: #fff;
+  border-radius: 10px;
+  padding: 20px 16px 16px;
+  max-width: 380px;
+  width: 100%;
+  margin-top: 40px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+#caja-buscar button#cerrar-buscar {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  width: auto;
+  padding: 2px 8px;
+  font-size: 18px;
+  line-height: 1;
+  background: transparent;
+  color: #666;
+  border: none;
+  margin: 0;
+}
+
+#input-buscar {
+  width: 100%;
+  padding: 10px;
+  font-size: 15px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  box-sizing: border-box;
+}
+
+#resultados-buscar {
+  overflow-y: auto;
+}
+
+.resultado-cliente {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 6px;
+  border: none;
+  border-bottom: 1px solid #eee;
+  background: none;
+  font-size: 13px;
+  color: #222;
+}
+
+.resultado-cliente .direccion-resultado {
+  display: block;
+  font-size: 11px;
+  color: #777;
+}
+
+.sin-resultados {
+  font-size: 13px;
+  color: #888;
+  padding: 8px 6px;
+}
+
+.control-ubicacion a {
+  font-size: 18px !important;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+}
+
+.marcador-yo {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #4285F4;
+  border: 3px solid #fff;
+  box-shadow: 0 0 0 2px #4285F4, 0 0 6px rgba(0,0,0,0.5);
+}
+
+.btn-entregado {
+  display: block;
+  width: 100%;
+  text-align: center;
+  padding: 6px 0;
+  margin-top: 8px;
+  font-size: 12px;
+  font-weight: bold;
+  border-radius: 4px;
+  border: none;
+  color: #fff;
+  background: #2e7d32;
+}
+
+.btn-entregado.hecho {
+  background: #757575;
+}
+
+.marcador-color.entregado span {
+  opacity: 0.35;
+}
+
+.check-entregado {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  background: #2e7d32;
+  color: #fff;
+  border-radius: 50%;
+  width: 14px;
+  height: 14px;
+  font-size: 10px;
+  font-style: normal;
+  line-height: 14px;
+  text-align: center;
+}

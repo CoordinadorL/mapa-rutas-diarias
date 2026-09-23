@@ -45,6 +45,28 @@ tonos parecidos en el mismo camión). Si un camión tiene más de un vendedor,
 aparece una leyenda de colores debajo del resumen. Los colores se pueden
 repetir de un camión a otro, pero nunca dentro del mismo.
 
+## Navegación y etiquetas
+
+Cada cliente tiene en su popup dos botones chiquitos, **Maps** y **Waze**,
+que abren la navegación directa a ese punto (usan la app si está instalada
+en el celular). Además, al acercar bastante el zoom aparece el nombre de
+cada cliente al lado del punto (como en My Maps); al alejar, se ocultan
+solas para no saturar el mapa.
+
+## Modo sin conexión
+
+El sitio guarda en el celular (service worker, `sw.js`) el mapa base y las
+imágenes del mapa que ya se vieron, además de la última versión de los
+datos del día. Así, después de abrirlo una vez con wifi o datos (por
+ejemplo en la mañana antes de salir), sigue funcionando aunque después se
+quede sin señal — no puede descargar zonas nuevas del mapa sin conexión,
+pero todo lo ya visto y los datos del día quedan disponibles.
+
+**Importante**: cuando cambies `app.js` o `style.css`, además de subir el
+número de `?v=` en `index.html` (ver más abajo), sube también
+`CACHE_VERSION` en `sw.js` — si no, el celular puede seguir usando la
+copia vieja guardada.
+
 ## Cómo se usa cada día
 
 1. Genera los archivos `MAPA F1xx.xlsx` de siempre en la carpeta del día
@@ -72,6 +94,7 @@ python convertir.py "C:\RUTAS DIARIAS\15MARTES 15"
 - `actualizar_ruta.bat` — genera `data/latest.json` desde la carpeta del día.
 - `publicar_datos.bat` — sube ese archivo al repo privado `mapa-rutas-datos`.
 - `TOKEN.md` — cómo generar y repartir el código de acceso.
+- `sw.js` — service worker para que el mapa funcione sin conexión.
 
 El repo privado `mapa-rutas-datos` es una carpeta aparte en
 `C:\MAPA-RUTAS-DATOS` (clon de ese repo); `publicar_datos.bat` ya sabe copiar

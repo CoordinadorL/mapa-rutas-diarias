@@ -1,6 +1,13 @@
 (function () {
   "use strict";
 
+  // Deja el mapa usable sin señal despues de la primera carga del dia.
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(function (err) {
+      console.error("No se pudo activar el modo sin conexion:", err);
+    });
+  }
+
   var mapa = L.map("mapa", { zoomControl: true }).setView([-1.7, -79.0], 12);
 
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -9,6 +16,14 @@
   }).addTo(mapa);
 
   var capaMarcadores = L.layerGroup().addTo(mapa);
+  var ZOOM_MOSTRAR_ETIQUETAS = 16;
+
+  function actualizarEtiquetas() {
+    mapaEl.classList.toggle("mostrar-etiquetas", mapa.getZoom() >= ZOOM_MOSTRAR_ETIQUETAS);
+  }
+
+  mapa.on("zoomend", actualizarEtiquetas);
+
   var barraSuperiorEl = document.getElementById("barra-superior");
   var infoSuperiorEl = document.getElementById("info-superior");
   var mapaEl = document.getElementById("mapa");
@@ -285,9 +300,20 @@
         (cliente.vendedor ? " · Vendedor " + escaparHtml(cliente.vendedor) : "") +
         "</span>" +
         (cliente.venta ? '<div class="venta">' + formatoMoneda(cliente.venta) + "</div>" : "") +
+        '<div class="fila-navegar">' +
+        '<a class="btn-navegar btn-maps" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=' + pos[0] + "," + pos[1] + '">Maps</a>' +
+        '<a class="btn-navegar btn-waze" target="_blank" rel="noopener" href="https://waze.com/ul?ll=' + pos[0] + "," + pos[1] + '&navigate=yes">Waze</a>' +
+        "</div>" +
         (esAdmin ? '<div class="ayuda-admin">Arrastra el punto para corregir la ubicacion</div>' : "") +
         "</div>";
       marcador.bindPopup(html);
+
+      marcador.bindTooltip(cliente.nombre, {
+        permanent: true,
+        direction: "top",
+        offset: [0, -8],
+        className: "etiqueta-cliente",
+      });
 
       if (esAdmin) {
         marcador.on("dragend", function () {
@@ -302,6 +328,7 @@
     if (puntos.length) {
       mapa.fitBounds(puntos, { padding: [30, 30] });
     }
+    actualizarEtiquetas();
 
     var totalVenta = camion.clientes.reduce(function (acc, c) { return acc + (c.venta || 0); }, 0);
     resumenEl.textContent =

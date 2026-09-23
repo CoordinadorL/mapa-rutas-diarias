@@ -30,6 +30,13 @@ Para no tener que pegar el código a mano en cada celular (es largo), se
 reparte como un **link** que ya lo trae incluido — ver la sección
 "Como armar los links" en [TOKEN.md](TOKEN.md).
 
+Como administrador tenés un botón flotante **"Compartir con choferes"**
+(solo vos lo ves) donde pegás una vez el código de chofer y después podés:
+- Abrir WhatsApp con el mensaje y el link ya armados, listo para elegir a
+  quién mandárselo.
+- Generar un código QR para imprimir o mostrar en pantalla — un chofer
+  nuevo lo escanea con la cámara y queda configurado, sin copiar nada.
+
 ## Colores por vendedor
 
 Dentro de cada camión, los clientes se pintan de un color distinto según su

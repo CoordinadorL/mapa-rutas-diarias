@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Mapa de Rutas Diarias</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
 
@@ -41,7 +41,32 @@
   </div>
 </div>
 
+<button id="boton-compartir" class="oculto">Compartir con choferes</button>
+
+<div id="panel-compartir" class="oculto">
+  <div id="caja-compartir">
+    <button id="cerrar-compartir" aria-label="Cerrar">&times;</button>
+    <strong>Compartir acceso con choferes</strong>
+
+    <label for="input-codigo-compartir">Codigo de chofer (el de solo lectura)</label>
+    <input type="text" id="input-codigo-compartir" autocomplete="off" placeholder="Pega aqui el codigo de chofer">
+    <p class="ayuda-compartir">Se guarda solo en este navegador, para no tener que pegarlo cada vez.</p>
+    <button id="guardar-codigo-compartir">Guardar</button>
+
+    <hr>
+
+    <button id="generar-whatsapp" disabled>Abrir WhatsApp para enviar</button>
+    <button id="generar-qr" disabled>Generar codigo QR</button>
+
+    <div id="resultado-qr" class="oculto">
+      <div id="qr-imagen"></div>
+      <a id="descargar-qr" download="mapa-rutas-qr.png">Descargar imagen</a>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-<script src="app.js?v=2"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="app.js?v=4"></script>
 </body>
 </html>

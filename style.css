@@ -248,3 +248,136 @@ html, body {
 #error-codigo.oculto {
   display: none;
 }
+
+#boton-compartir {
+  position: fixed;
+  right: 16px;
+  bottom: 20px;
+  z-index: 1400;
+  background: #1b5e20;
+  color: #fff;
+  border: none;
+  padding: 12px 16px;
+  border-radius: 24px;
+  font-size: 14px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+}
+
+#boton-compartir.oculto {
+  display: none;
+}
+
+#panel-compartir {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+#panel-compartir.oculto {
+  display: none;
+}
+
+#caja-compartir {
+  position: relative;
+  background: #fff;
+  border-radius: 10px;
+  padding: 24px 20px 20px;
+  max-width: 360px;
+  width: 100%;
+  text-align: left;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+#caja-compartir strong {
+  display: block;
+  margin-bottom: 14px;
+  font-size: 16px;
+  text-align: center;
+}
+
+#caja-compartir label {
+  display: block;
+  font-size: 13px;
+  color: #333;
+  margin-bottom: 4px;
+}
+
+#caja-compartir input {
+  width: 100%;
+  padding: 10px;
+  font-size: 14px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  margin-bottom: 6px;
+  box-sizing: border-box;
+}
+
+.ayuda-compartir {
+  font-size: 12px;
+  color: #777;
+  margin: 0 0 10px;
+}
+
+#caja-compartir button {
+  width: 100%;
+  padding: 10px;
+  font-size: 14px;
+  border: none;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  background: #1b5e20;
+  color: #fff;
+}
+
+#caja-compartir button:disabled {
+  background: #a5a5a5;
+}
+
+#guardar-codigo-compartir {
+  background: #333;
+}
+
+#caja-compartir hr {
+  border: none;
+  border-top: 1px solid #eee;
+  margin: 12px 0;
+}
+
+#caja-compartir button#cerrar-compartir {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: auto;
+  padding: 2px 8px;
+  font-size: 18px;
+  line-height: 1;
+  background: transparent;
+  color: #666;
+  margin: 0;
+}
+
+#resultado-qr {
+  text-align: center;
+  margin-top: 10px;
+}
+
+#resultado-qr.oculto {
+  display: none;
+}
+
+#qr-imagen {
+  display: inline-block;
+  margin-bottom: 10px;
+}
+
+#descargar-qr {
+  display: inline-block;
+  font-size: 13px;
+  color: #1b5e20;
+}

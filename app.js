@@ -23,6 +23,16 @@
   var inputCodigoEl = document.getElementById("input-codigo");
   var botonCodigoEl = document.getElementById("boton-codigo");
   var errorCodigoEl = document.getElementById("error-codigo");
+  var botonCompartirEl = document.getElementById("boton-compartir");
+  var panelCompartirEl = document.getElementById("panel-compartir");
+  var cerrarCompartirEl = document.getElementById("cerrar-compartir");
+  var inputCodigoCompartirEl = document.getElementById("input-codigo-compartir");
+  var guardarCodigoCompartirEl = document.getElementById("guardar-codigo-compartir");
+  var generarWhatsappEl = document.getElementById("generar-whatsapp");
+  var generarQrEl = document.getElementById("generar-qr");
+  var resultadoQrEl = document.getElementById("resultado-qr");
+  var qrImagenEl = document.getElementById("qr-imagen");
+  var descargarQrEl = document.getElementById("descargar-qr");
   var datos = null;
   var overrides = {};
 
@@ -45,6 +55,7 @@
   var ARCHIVO_OVERRIDES = "overrides.json";
   var CLAVE_CODIGO = "mrd_codigo";
   var CLAVE_ADMIN = "mrd_admin";
+  var CLAVE_CODIGO_COMPARTIR = "mrd_codigo_compartir";
 
   var PALETA_COLORES = [
     "#e6194B", "#4363d8", "#3cb44b", "#f58231", "#911eb4",
@@ -144,6 +155,7 @@
       .then(function () {
         guardarStorage(esAdmin ? CLAVE_ADMIN : CLAVE_CODIGO, token);
         badgeAdminEl.classList.toggle("oculto", !esAdmin);
+        botonCompartirEl.classList.toggle("oculto", !esAdmin);
         fechaRutaEl.textContent = "Ruta del " + datos.fecha;
         poblarSelector();
         if (datos.camiones.length) {
@@ -346,6 +358,68 @@
   selector.addEventListener("change", function () {
     var admin = leerStorage(CLAVE_ADMIN);
     pintarCamion(selector.value, !!admin, admin);
+  });
+
+  function linkParaChofer(codigo) {
+    return window.location.origin + window.location.pathname + "#codigo=" + codigo;
+  }
+
+  function actualizarBotonesCompartir() {
+    var hayCodigo = !!inputCodigoCompartirEl.value.trim();
+    generarWhatsappEl.disabled = !hayCodigo;
+    generarQrEl.disabled = !hayCodigo;
+  }
+
+  botonCompartirEl.addEventListener("click", function () {
+    inputCodigoCompartirEl.value = leerStorage(CLAVE_CODIGO_COMPARTIR);
+    actualizarBotonesCompartir();
+    resultadoQrEl.classList.add("oculto");
+    qrImagenEl.innerHTML = "";
+    panelCompartirEl.classList.remove("oculto");
+  });
+
+  cerrarCompartirEl.addEventListener("click", function () {
+    panelCompartirEl.classList.add("oculto");
+  });
+
+  inputCodigoCompartirEl.addEventListener("input", actualizarBotonesCompartir);
+
+  guardarCodigoCompartirEl.addEventListener("click", function () {
+    guardarStorage(CLAVE_CODIGO_COMPARTIR, inputCodigoCompartirEl.value.trim());
+    actualizarBotonesCompartir();
+    mostrarEstadoGuardado("Codigo guardado en este navegador", false);
+  });
+
+  generarWhatsappEl.addEventListener("click", function () {
+    var codigo = inputCodigoCompartirEl.value.trim();
+    if (!codigo) return;
+    var mensaje =
+      "Mapa de la ruta de hoy:\n" + linkParaChofer(codigo) +
+      "\n\nAbrelo una sola vez, despues va a quedar guardado en tu celular.";
+    window.open("https://wa.me/?text=" + encodeURIComponent(mensaje), "_blank");
+  });
+
+  generarQrEl.addEventListener("click", function () {
+    var codigo = inputCodigoCompartirEl.value.trim();
+    if (!codigo) return;
+
+    qrImagenEl.innerHTML = "";
+    new QRCode(qrImagenEl, {
+      text: linkParaChofer(codigo),
+      width: 220,
+      height: 220,
+    });
+
+    setTimeout(function () {
+      var canvas = qrImagenEl.querySelector("canvas");
+      if (canvas) {
+        descargarQrEl.href = canvas.toDataURL("image/png");
+        descargarQrEl.classList.remove("oculto");
+      } else {
+        descargarQrEl.classList.add("oculto");
+      }
+      resultadoQrEl.classList.remove("oculto");
+    }, 50);
   });
 
   tomarCodigosDelLink();

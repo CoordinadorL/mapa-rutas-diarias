@@ -31,15 +31,17 @@
   var marcadorYo = null;
   var idVigilarUbicacion = null;
 
+  var botonUbicacionEl = null;
+
   var ControlUbicacion = L.Control.extend({
     options: { position: "topleft" },
     onAdd: function () {
       var contenedor = L.DomUtil.create("div", "leaflet-bar control-ubicacion");
-      var boton = L.DomUtil.create("a", "", contenedor);
-      boton.href = "#";
-      boton.title = "Mostrar mi ubicacion";
-      boton.innerHTML = "📍";
-      L.DomEvent.on(boton, "click", function (e) {
+      botonUbicacionEl = L.DomUtil.create("a", "", contenedor);
+      botonUbicacionEl.href = "#";
+      botonUbicacionEl.title = "Mostrar mi ubicacion";
+      botonUbicacionEl.innerHTML = "📍";
+      L.DomEvent.on(botonUbicacionEl, "click", function (e) {
         L.DomEvent.stop(e);
         alternarMiUbicacion();
       });
@@ -57,6 +59,8 @@
         mapa.removeLayer(marcadorYo);
         marcadorYo = null;
       }
+      botonUbicacionEl.classList.remove("activo");
+      botonUbicacionEl.title = "Mostrar mi ubicacion";
       return;
     }
 
@@ -64,6 +68,9 @@
       mostrarEstadoGuardado("Este celular no puede compartir su ubicacion", true);
       return;
     }
+
+    botonUbicacionEl.classList.add("activo");
+    botonUbicacionEl.title = "Ocultar mi ubicacion (esta activo)";
 
     idVigilarUbicacion = navigator.geolocation.watchPosition(
       function (posicion) {
@@ -81,6 +88,8 @@
       function () {
         mostrarEstadoGuardado("No se pudo obtener tu ubicacion", true);
         idVigilarUbicacion = null;
+        botonUbicacionEl.classList.remove("activo");
+        botonUbicacionEl.title = "Mostrar mi ubicacion";
       },
       { enableHighAccuracy: true, maximumAge: 5000 }
     );
@@ -243,11 +252,13 @@
         botonCompartirEl.classList.toggle("oculto", !esAdmin);
         fechaRutaEl.textContent = "Ruta del " + datos.fecha;
         poblarSelector();
+        pantallaCodigoEl.classList.add("oculto");
         if (datos.camiones.length) {
           pintarCamion(datos.camiones[0].id, esAdmin, token);
+          estadoCargaEl.classList.add("oculto");
+        } else {
+          estadoCargaEl.textContent = "No hay rutas para mostrar hoy.";
         }
-        pantallaCodigoEl.classList.add("oculto");
-        estadoCargaEl.classList.add("oculto");
       })
       .catch(function (err) {
         if (err.message === "codigo-invalido") {
@@ -313,11 +324,17 @@
   }
 
   function marcarEntregado(codigo, entregado) {
+    // Vuelve a leer de localStorage justo antes de guardar (no usa la
+    // variable "entregados" que ya esta en memoria): si el celular tiene
+    // dos pestañas del mapa abiertas, esto evita que una pestaña vieja
+    // sobreescriba y "desmarque" una entrega que se hizo en la otra.
+    var actual = cargarEntregados();
     if (entregado) {
-      entregados[codigo] = true;
+      actual[codigo] = true;
     } else {
-      delete entregados[codigo];
+      delete actual[codigo];
     }
+    entregados = actual;
     try {
       localStorage.setItem(claveEntregados(), JSON.stringify(entregados));
     } catch (e) {}
@@ -543,8 +560,9 @@
     }
 
     resultadosBuscarEl.innerHTML = clientes.map(function (c) {
-      return '<button type="button" class="resultado-cliente" data-codigo="' + escaparHtml(String(c.codigo)) + '">' +
-        escaparHtml(c.nombre) +
+      var entregado = !!entregados[c.codigo];
+      return '<button type="button" class="resultado-cliente' + (entregado ? " entregado" : "") + '" data-codigo="' + escaparHtml(String(c.codigo)) + '">' +
+        (entregado ? "✓ " : "") + escaparHtml(c.nombre) +
         '<span class="direccion-resultado">' + escaparHtml(c.direccion) + "</span>" +
         "</button>";
     }).join("");

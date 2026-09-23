@@ -60,11 +60,12 @@ solas para no saturar el mapa.
   abre su popup.
 - **Mi ubicación** (📍 arriba a la izquierda, junto al zoom): muestra un
   punto azul con la posición del celular, para ver qué tan cerca está de
-  las próximas paradas. Nunca se manda a ningún lado, solo se dibuja en
-  ese celular.
+  las próximas paradas. El botón queda resaltado en verde mientras está
+  activo. Nunca se manda a ningún lado, solo se dibuja en ese celular.
 - **Marcar entregado**: botón dentro del popup de cada cliente. El punto
-  queda atenuado con una palomita, y arriba se cuenta cuántos van
-  entregados. Se guarda solo en el celular de quien lo marca y se
+  queda atenuado con una palomita (también se ve en los resultados del
+  buscador), y arriba se cuenta cuántos van entregados. Se guarda solo
+  en el celular de quien lo marca y se
   reinicia solo al otro día con la ruta nueva (no se sube a ningún repo).
 
 ## Modo sin conexión

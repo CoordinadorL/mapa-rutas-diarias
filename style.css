@@ -523,6 +523,14 @@ html, body {
   color: #777;
 }
 
+.resultado-cliente.entregado {
+  color: #2e7d32;
+}
+
+.resultado-cliente.entregado .direccion-resultado {
+  color: #6ba36e;
+}
+
 .sin-resultados {
   font-size: 13px;
   color: #888;
@@ -534,6 +542,11 @@ html, body {
   display: flex !important;
   align-items: center;
   justify-content: center;
+}
+
+.control-ubicacion a.activo {
+  background: #e8f5e9 !important;
+  box-shadow: inset 0 0 0 2px #2e7d32;
 }
 
 .marcador-yo {

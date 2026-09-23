@@ -296,9 +296,7 @@
         '<div class="popup-cliente">' +
         "<b>" + (i + 1) + ". " + escaparHtml(cliente.nombre) + "</b><br>" +
         escaparHtml(cliente.direccion) + "<br>" +
-        '<span class="canal">' + escaparHtml(cliente.canal) +
-        (cliente.vendedor ? " · Vendedor " + escaparHtml(cliente.vendedor) : "") +
-        "</span>" +
+        (cliente.vendedor ? '<span class="canal">Vendedor ' + escaparHtml(cliente.vendedor) + "</span>" : "") +
         (cliente.venta ? '<div class="venta">' + formatoMoneda(cliente.venta) + "</div>" : "") +
         '<div class="fila-navegar">' +
         '<a class="btn-navegar btn-maps" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=' + pos[0] + "," + pos[1] + '">Maps</a>' +

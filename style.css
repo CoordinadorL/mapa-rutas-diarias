@@ -178,17 +178,22 @@ html, body {
   font-weight: 600;
   color: #222;
   white-space: nowrap;
-  opacity: 0;
   pointer-events: none;
-  transition: opacity 0.15s;
 }
 
 .etiqueta-cliente::before {
   display: none;
 }
 
+/* Leaflet le pone su propia opacidad "inline" a las etiquetas (permanent
+   tooltip), asi que una regla normal de CSS no alcanza para ocultarlas.
+   Por eso se esconden con display + !important, que si le gana. */
+#mapa .etiqueta-cliente {
+  display: none !important;
+}
+
 #mapa.mostrar-etiquetas .etiqueta-cliente {
-  opacity: 1;
+  display: block !important;
 }
 
 .marcador-color span {

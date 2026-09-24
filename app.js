@@ -100,6 +100,8 @@
   var mapaEl = document.getElementById("mapa");
   var selector = document.getElementById("selector-camion");
   var fechaRutaEl = document.getElementById("fecha-ruta");
+  var fechaRutaTextoEl = document.getElementById("fecha-ruta-texto");
+  var badgeHistoricoEl = document.getElementById("badge-historico");
   var resumenEl = document.getElementById("resumen-camion");
   var leyendaEl = document.getElementById("leyenda-colores");
   var estadoCargaEl = document.getElementById("estado-carga");
@@ -124,11 +126,23 @@
   var cerrarBuscarEl = document.getElementById("cerrar-buscar");
   var inputBuscarEl = document.getElementById("input-buscar");
   var resultadosBuscarEl = document.getElementById("resultados-buscar");
+  var panelCalendarioEl = document.getElementById("panel-calendario");
+  var cerrarCalendarioEl = document.getElementById("cerrar-calendario");
+  var mesAnteriorEl = document.getElementById("mes-anterior");
+  var mesSiguienteEl = document.getElementById("mes-siguiente");
+  var calendarioTituloEl = document.getElementById("calendario-titulo");
+  var calendarioGridEl = document.getElementById("calendario-grid");
+  var botonVolverHoyEl = document.getElementById("boton-volver-hoy");
   var datos = null;
   var overrides = {};
   var camionActual = null;
   var marcadoresPorCodigo = {};
   var entregados = {};
+  var fechaHoy = null;
+  var fechaSeleccionada = null;
+  var modoHistorico = false;
+  var fechasDisponibles = null;
+  var mesCalendarioMostrado = null;
 
   // El mapa (index.html/app.js) es publico. Los datos reales de clientes
   // viven en un repo PRIVADO aparte (mapa-rutas-datos) para no exponerlos.
@@ -250,7 +264,12 @@
         guardarStorage(esAdmin ? CLAVE_ADMIN : CLAVE_CODIGO, token);
         badgeAdminEl.classList.toggle("oculto", !esAdmin);
         botonCompartirEl.classList.toggle("oculto", !esAdmin);
-        fechaRutaEl.textContent = "Ruta del " + datos.fecha;
+        fechaHoy = datos.fecha;
+        fechaSeleccionada = datos.fecha;
+        modoHistorico = false;
+        badgeHistoricoEl.classList.add("oculto");
+        botonVolverHoyEl.classList.add("oculto");
+        fechaRutaTextoEl.textContent = "Ruta del " + datos.fecha;
         poblarSelector();
         pantallaCodigoEl.classList.add("oculto");
         if (datos.camiones.length) {
@@ -280,6 +299,151 @@
 
   inputCodigoEl.addEventListener("keydown", function (e) {
     if (e.key === "Enter") botonCodigoEl.click();
+  });
+
+  function obtenerSesionActual() {
+    var admin = leerStorage(CLAVE_ADMIN);
+    if (admin) return { token: admin, esAdmin: true };
+    return { token: leerStorage(CLAVE_CODIGO), esAdmin: false };
+  }
+
+  // Historial: cada dia que se publica una ruta nueva, la anterior queda
+  // guardada en historial/<fecha>.json (lo hace publicar_datos.bat solo,
+  // no hace falta ningun boton). Esto solo pide esos datos cuando alguien
+  // abre el calendario — el uso normal (ver la ruta de hoy) no cambia en
+  // nada ni pesa mas.
+  function cargarFecha(fecha) {
+    var sesion = obtenerSesionActual();
+    var archivo = fecha === fechaHoy ? ARCHIVO_DATOS : "historial/" + fecha + ".json";
+
+    estadoCargaEl.textContent = "Cargando ruta...";
+    estadoCargaEl.classList.remove("oculto");
+
+    pedirArchivoRepo(archivo, sesion.token)
+      .then(function (r) {
+        if (!r.ok) throw new Error("No se pudo cargar esa fecha");
+        return r.json();
+      })
+      .then(function (contenido) {
+        datos = JSON.parse(utf8Base64(contenido.content));
+        fechaSeleccionada = fecha;
+        modoHistorico = fecha !== fechaHoy;
+        badgeHistoricoEl.classList.toggle("oculto", !modoHistorico);
+        botonVolverHoyEl.classList.toggle("oculto", !modoHistorico);
+        fechaRutaTextoEl.textContent = "Ruta del " + datos.fecha;
+        poblarSelector();
+        if (datos.camiones.length) {
+          pintarCamion(datos.camiones[0].id, sesion.esAdmin, sesion.token);
+        }
+        estadoCargaEl.classList.add("oculto");
+      })
+      .catch(function (err) {
+        estadoCargaEl.textContent = "No se pudo cargar esa fecha. Intenta de nuevo.";
+        console.error(err);
+      });
+  }
+
+  function obtenerFechasDisponibles(token) {
+    if (fechasDisponibles) return Promise.resolve(fechasDisponibles);
+
+    return pedirArchivoRepo("historial", token)
+      .then(function (r) {
+        return r.ok ? r.json() : [];
+      })
+      .then(function (lista) {
+        fechasDisponibles = new Set(
+          (Array.isArray(lista) ? lista : [])
+            .map(function (item) { return item.name.replace(/\.json$/, ""); })
+        );
+        if (fechaHoy) fechasDisponibles.add(fechaHoy);
+        return fechasDisponibles;
+      })
+      .catch(function () {
+        fechasDisponibles = new Set(fechaHoy ? [fechaHoy] : []);
+        return fechasDisponibles;
+      });
+  }
+
+  var NOMBRES_MES = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+  ];
+
+  function pad2(n) {
+    return n < 10 ? "0" + n : "" + n;
+  }
+
+  function renderizarCalendario() {
+    var anio = mesCalendarioMostrado.anio;
+    var mes = mesCalendarioMostrado.mes;
+    calendarioTituloEl.textContent = NOMBRES_MES[mes] + " " + anio;
+
+    var primerDiaSemana = new Date(anio, mes, 1).getDay();
+    var diasEnMes = new Date(anio, mes + 1, 0).getDate();
+    var hoyRealStr = new Date().toISOString().slice(0, 10);
+
+    var html = "";
+    for (var i = 0; i < primerDiaSemana; i++) {
+      html += '<span class="dia-cal relleno"></span>';
+    }
+    for (var d = 1; d <= diasEnMes; d++) {
+      var fechaStr = anio + "-" + pad2(mes + 1) + "-" + pad2(d);
+      var disponible = fechasDisponibles.has(fechaStr);
+      var clases = "dia-cal " + (disponible ? "disponible" : "sin-datos");
+      if (fechaStr === fechaSeleccionada) clases += " seleccionado";
+      if (fechaStr === hoyRealStr) clases += " hoy";
+      html +=
+        '<button type="button" class="' + clases + '" data-fecha="' + fechaStr + '"' +
+        (disponible ? "" : " disabled") + ">" + d + "</button>";
+    }
+    calendarioGridEl.innerHTML = html;
+
+    Array.prototype.forEach.call(calendarioGridEl.querySelectorAll(".dia-cal.disponible"), function (boton) {
+      boton.addEventListener("click", function () {
+        panelCalendarioEl.classList.add("oculto");
+        cargarFecha(boton.getAttribute("data-fecha"));
+      });
+    });
+  }
+
+  fechaRutaEl.addEventListener("click", function () {
+    var sesion = obtenerSesionActual();
+    panelCalendarioEl.classList.remove("oculto");
+    calendarioGridEl.innerHTML = '<p class="cargando-calendario">Cargando fechas...</p>';
+
+    obtenerFechasDisponibles(sesion.token).then(function () {
+      var base = fechaSeleccionada || fechaHoy || new Date().toISOString().slice(0, 10);
+      var partes = base.split("-");
+      mesCalendarioMostrado = { anio: parseInt(partes[0], 10), mes: parseInt(partes[1], 10) - 1 };
+      renderizarCalendario();
+    });
+  });
+
+  cerrarCalendarioEl.addEventListener("click", function () {
+    panelCalendarioEl.classList.add("oculto");
+  });
+
+  mesAnteriorEl.addEventListener("click", function () {
+    mesCalendarioMostrado.mes--;
+    if (mesCalendarioMostrado.mes < 0) {
+      mesCalendarioMostrado.mes = 11;
+      mesCalendarioMostrado.anio--;
+    }
+    renderizarCalendario();
+  });
+
+  mesSiguienteEl.addEventListener("click", function () {
+    mesCalendarioMostrado.mes++;
+    if (mesCalendarioMostrado.mes > 11) {
+      mesCalendarioMostrado.mes = 0;
+      mesCalendarioMostrado.anio++;
+    }
+    renderizarCalendario();
+  });
+
+  botonVolverHoyEl.addEventListener("click", function () {
+    panelCalendarioEl.classList.add("oculto");
+    cargarFecha(fechaHoy);
   });
 
   function ajustarAltoMapa() {
@@ -421,6 +585,12 @@
     marcadoresPorCodigo = {};
     entregados = cargarEntregados();
 
+    // Corregir un punto (arrastrarlo) cambia overrides.json para siempre,
+    // no solo para el dia que se esta viendo — por eso no se permite
+    // mientras se mira un dia del historial (para no confundir "ver" con
+    // "editar"). Para corregir un punto hay que volver a "hoy" primero.
+    var puedeEditar = !!esAdmin && !modoHistorico;
+
     var puntos = [];
 
     camion.clientes.forEach(function (cliente, i) {
@@ -428,7 +598,7 @@
       var estaEntregado = !!entregados[cliente.codigo];
       var marcador = L.marker(pos, {
         icon: iconoColor(cliente.color || "#4363d8", estaEntregado),
-        draggable: !!esAdmin,
+        draggable: puedeEditar,
       }).addTo(capaMarcadores);
 
       var html =
@@ -444,7 +614,7 @@
         '<button type="button" class="btn-entregado' + (estaEntregado ? " hecho" : "") + '">' +
         (estaEntregado ? "↺ Deshacer entrega" : "✓ Marcar entregado") +
         "</button>" +
-        (esAdmin ? '<div class="ayuda-admin">Arrastra el punto para corregir la ubicacion</div>' : "") +
+        (puedeEditar ? '<div class="ayuda-admin">Arrastra el punto para corregir la ubicacion</div>' : "") +
         "</div>";
       marcador.bindPopup(html);
 
@@ -469,7 +639,7 @@
         };
       });
 
-      if (esAdmin) {
+      if (puedeEditar) {
         marcador.on("dragend", function () {
           var nueva = marcador.getLatLng();
           guardarOverride(cliente.codigo, nueva.lat, nueva.lng, tokenAdmin);

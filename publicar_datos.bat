@@ -14,27 +14,32 @@ if not exist "%ORIGEN%" (
   exit /b 1
 )
 
-copy /y "%ORIGEN%" "%DESTINO%\latest.json"
-
 cd /d "%DESTINO%"
-git add latest.json
-git commit -m "Ruta del dia"
 
 REM Cuando arrastras un punto para corregirlo (modo admin), eso se sube
 REM directo a GitHub por internet, sin pasar por esta carpeta. Por eso
-REM antes de subir lo de hoy hay que traer primero esos cambios (si los
-REM hay) para no toparse con un "push rechazado" que se ignore en
-REM silencio y deje sin publicar la ruta del dia.
+REM antes de archivar/publicar lo de hoy hay que traer primero esos
+REM cambios (si los hay), para no toparse con un "push rechazado" que
+REM se ignore en silencio y deje sin publicar la ruta del dia.
 git pull --rebase origin main
 if errorlevel 1 (
   echo.
   echo ========================================================
   echo ERROR: no se pudo combinar con los cambios de GitHub.
-  echo NO se subio la ruta de hoy. Avisa antes de intentar de nuevo.
+  echo NO se archivo ni se subio nada. Avisa antes de reintentar.
   echo ========================================================
   pause
   exit /b 1
 )
+
+REM Guarda la ruta que estaba publicada (la de ayer) en historial/
+REM ANTES de sobreescribirla con la de hoy.
+python "%~dp0archivar_dia.py" "%DESTINO%" "%ORIGEN%"
+
+copy /y "%ORIGEN%" "%DESTINO%\latest.json"
+
+git add latest.json historial
+git commit -m "Ruta del dia"
 
 git push
 if errorlevel 1 (

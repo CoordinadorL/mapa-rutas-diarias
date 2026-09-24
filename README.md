@@ -68,6 +68,22 @@ solas para no saturar el mapa.
   en el celular de quien lo marca y se
   reinicia solo al otro día con la ruta nueva (no se sube a ningún repo).
 
+## Historial de rutas
+
+Tocando el texto **"Ruta del ..."** (arriba, junto al título) se abre un
+calendario: los días con ruta guardada se ven normales y son tocables, los
+que no tienen datos salen apagados. Al elegir un día aparece la etiqueta
+**HISTÓRICO** y esa ruta (mismo mapa, colores, popups, Maps/Waze) — con un
+botón **"Volver a hoy"** para salir. Mientras se ve un día del historial no
+se pueden arrastrar puntos (eso solo aplica a "hoy"), pero "marcar
+entregado" sigue funcionando igual, guardado por fecha.
+
+Esto se archiva **solo**, sin ningún botón aparte: cada vez que corres
+`publicar_datos.bat` con la ruta de un día nuevo, la que estaba publicada
+justo antes queda guardada en `historial/<fecha>.json` dentro del repo
+privado, antes de reemplazarla. Si corres el script dos veces el mismo día
+(una corrección), no se archiva de nuevo.
+
 ## Modo sin conexión
 
 El sitio guarda en el celular (service worker, `sw.js`) el mapa base y las
@@ -107,15 +123,17 @@ python convertir.py "C:\RUTAS DIARIAS\15MARTES 15"
 - `data/latest.json` — datos del día actual, solo en esta computadora
   (está en `.gitignore`, nunca se sube a este repo público).
 - `actualizar_ruta.bat` — genera `data/latest.json` desde la carpeta del día.
-- `publicar_datos.bat` — sube ese archivo al repo privado `mapa-rutas-datos`.
+- `publicar_datos.bat` — combina con GitHub, archiva la ruta anterior en
+  `historial/` si cambió la fecha, y sube la nueva a `mapa-rutas-datos`.
+- `archivar_dia.py` — lo usa `publicar_datos.bat`, no hace falta correrlo a mano.
 - `TOKEN.md` — cómo generar y repartir el código de acceso.
 - `sw.js` — service worker para que el mapa funcione sin conexión.
 
 El repo privado `mapa-rutas-datos` es una carpeta aparte en
 `C:\MAPA-RUTAS-DATOS` (clon de ese repo); `publicar_datos.bat` ya sabe copiar
 ahí el archivo y subirlo. Ese mismo repo privado también guarda
-`overrides.json`, que crea y actualiza el mapa solo cuando el administrador
-corrige la ubicación de un cliente (no hace falta tocarlo a mano).
+`overrides.json` (correcciones de ubicación) y `historial/<fecha>.json`
+(rutas de días anteriores) — nada de eso hay que tocarlo a mano.
 
 ## Probar en local
 

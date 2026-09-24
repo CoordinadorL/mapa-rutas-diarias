@@ -5,14 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Mapa de Rutas Diarias</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-<link rel="stylesheet" href="style.css?v=8">
+<link rel="stylesheet" href="style.css?v=9">
 </head>
 <body>
 
 <div id="barra-superior">
   <div id="titulo">
     <strong>Rutas Diarias <span id="badge-admin" class="oculto">ADMIN</span></strong>
-    <span id="fecha-ruta">--</span>
+    <button id="fecha-ruta" class="boton-fecha">
+      <span id="fecha-ruta-texto">--</span>
+      <span id="badge-historico" class="oculto">HISTÓRICO</span>
+    </button>
   </div>
   <select id="selector-camion">
     <option value="">Cargando...</option>
@@ -38,6 +41,23 @@
     <input type="password" id="input-codigo" autocomplete="off" placeholder="Pega aqui el codigo">
     <button id="boton-codigo">Entrar</button>
     <p id="error-codigo" class="oculto">Codigo incorrecto o vencido, intenta de nuevo.</p>
+  </div>
+</div>
+
+<div id="panel-calendario" class="oculto">
+  <div id="caja-calendario">
+    <button id="cerrar-calendario" aria-label="Cerrar">&times;</button>
+    <strong>Elige una fecha</strong>
+    <div id="calendario-header">
+      <button type="button" id="mes-anterior" aria-label="Mes anterior">&laquo;</button>
+      <span id="calendario-titulo">-- --</span>
+      <button type="button" id="mes-siguiente" aria-label="Mes siguiente">&raquo;</button>
+    </div>
+    <div id="calendario-dias-semana">
+      <span>Do</span><span>Lu</span><span>Ma</span><span>Mi</span><span>Ju</span><span>Vi</span><span>Sa</span>
+    </div>
+    <div id="calendario-grid"></div>
+    <button type="button" id="boton-volver-hoy" class="oculto">Volver a hoy</button>
   </div>
 </div>
 
@@ -77,6 +97,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="app.js?v=8"></script>
+<script src="app.js?v=9"></script>
 </body>
 </html>

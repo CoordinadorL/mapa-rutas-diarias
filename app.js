@@ -557,7 +557,9 @@
   }
 
   function actualizarResumen(camion) {
-    var totalVenta = camion.clientes.reduce(function (acc, c) { return acc + (c.venta || 0); }, 0);
+    // El total de la ruta es la "Suma de Total" (lo que realmente carga
+    // el transportista), no la "Suma de VentaNeta".
+    var totalRuta = camion.clientes.reduce(function (acc, c) { return acc + (c.total || 0); }, 0);
     var totalEntregados = camion.clientes.reduce(function (acc, c) {
       return acc + (entregados[c.codigo] ? 1 : 0);
     }, 0);
@@ -566,7 +568,7 @@
       camion.clientes.length + " clientes" +
       (totalEntregados ? " · " + totalEntregados + " entregados" : "") +
       (camion.chofer ? " · " + camion.chofer : "") +
-      (totalVenta ? " · " + formatoMoneda(totalVenta) : "");
+      (totalRuta ? " · " + formatoMoneda(totalRuta) : "");
     resumenEl.classList.add("visible");
   }
 
@@ -672,7 +674,7 @@
       }
     });
 
-    if (vendedores.length <= 1) {
+    if (!vendedores.length) {
       leyendaEl.innerHTML = "";
       leyendaEl.classList.add("oculto");
       return;

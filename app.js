@@ -668,12 +668,10 @@
     var vistos = {};
     camion.clientes.forEach(function (c) {
       var v = c.vendedor || "";
-      if (!v) return;
-      if (!vistos[v]) {
-        vistos[v] = { vendedor: v, color: c.color, pedidos: 0 };
-        vendedores.push(vistos[v]);
+      if (v && !vistos[v]) {
+        vistos[v] = true;
+        vendedores.push({ vendedor: v, color: c.color });
       }
-      vistos[v].pedidos++;
     });
 
     if (!vendedores.length) {
@@ -683,7 +681,7 @@
     }
 
     leyendaEl.innerHTML = vendedores.map(function (v) {
-      return '<span class="chip-vendedor"><i style="background:' + v.color + '"></i>' + escaparHtml(v.vendedor) + " (" + v.pedidos + ")</span>";
+      return '<span class="chip-vendedor"><i style="background:' + v.color + '"></i>' + escaparHtml(v.vendedor) + "</span>";
     }).join("");
     leyendaEl.classList.remove("oculto");
   }

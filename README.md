@@ -78,11 +78,49 @@ botón **"Volver a hoy"** para salir. Mientras se ve un día del historial no
 se pueden arrastrar puntos (eso solo aplica a "hoy"), pero "marcar
 entregado" sigue funcionando igual, guardado por fecha.
 
-Esto se archiva **solo**, sin ningún botón aparte: cada vez que corres
-`publicar_datos.bat` con la ruta de un día nuevo, la que estaba publicada
-justo antes queda guardada en `historial/<fecha>.json` dentro del repo
-privado, antes de reemplazarla. Si corres el script dos veces el mismo día
-(una corrección), no se archiva de nuevo.
+Esto se archiva **solo**, sin ningún botón aparte: cada vez que se publica
+una ruta, queda guardada **en ese mismo momento** en `historial/<fecha>.json`
+dentro del repo privado (si se republica el mismo día, una corrección, se
+reemplaza esa fecha). Por eso el histórico **no depende del maestro**: el
+maestro se puede vaciar y volver a llenar cada día sin perder nada. Los
+`MAPA Fxxx.xlsx` de cada día también quedan guardados en
+`BASE\MAPAS\<fecha> <DÍA>`.
+
+### Excel de control (histórico, ubicaciones y cambios de ruta)
+
+`BASE\CONTROL DE RUTAS.xlsx` (botón **"Excel de control"** de la ventana; se
+vuelve a armar solo después de cada publicación). Se arma únicamente con lo
+ya publicado (el historial del repo privado), nunca con el maestro.
+
+- **RUTAS**: cada cliente de cada ruta de los últimos 60 días, con filtros y
+  un enlace "Ver" a Google Maps. **RESUMEN**: por fecha y ruta, de todo el
+  histórico. **REVISAR UBICACIÓN**: clientes de la ruta vigente con
+  ubicación sospechosa (lejos de su ruta, varios en el mismo punto,
+  coordenada del sistema que cambió, o que no salen en el mapa).
+- **UBICACIONES** (editable): todas las correcciones de ubicación (las mismas
+  que el arrastre del modo admin). Se corrige/agrega pegando la coordenada
+  de Google Maps en "Nueva coordenada", o se quita con Acción = QUITAR. Se
+  aplican con "Aplicar ubicaciones" o al publicar. Si alguien movió ese
+  punto en el mapa después de armar el Excel, no se pisa: queda en
+  "Conflicto" para revisarlo.
+- **CAMBIOS DE RUTA** (editable): pasar un cliente (o una ruta entera con
+  TODOS) a otro chofer, **solo ese día** o **siempre**. Se aplica al generar
+  la ruta: el cliente sale en el mapa y en el MAPA Excel del nuevo chofer
+  (columna "Movido desde"), conserva su N° de liquidación original y no
+  cuenta como un segundo cargue. La columna Estado dice si se aplicó o por
+  qué no.
+
+Es un archivo con datos de clientes: queda solo en esta PC (BASE\ no se
+sube). Si se borra, se vuelve a armar y las reglas de CAMBIOS DE RUTA se
+recuperan de `data\control_editables.json`.
+
+### El maestro, liviano
+
+`BASE\RUTAS DIARIAS CAMIONES - MY MAPS.xlsx` solo tiene la hoja SABANA DE
+VENTA (sin tabla dinámica, "dia", RESUMEN ni modelo de datos). Cada día:
+deja la fila 1 (encabezados), borra los datos de ayer desde la fila 2 y
+pega los de hoy. **Ojo con el sábado**: si se trabaja sábado, pega juntos
+los datos del viernes y del sábado, porque la ruta los une.
 
 ## Modo sin conexión
 
@@ -100,17 +138,43 @@ copia vieja guardada.
 
 ## Cómo se usa cada día
 
-1. Genera los archivos `MAPA F1xx.xlsx` de siempre en la carpeta del día
-   (ej: `C:\RUTAS DIARIAS\15MARTES 15`), igual que hasta ahora para Google My Maps.
-2. Arrastra esa carpeta sobre `actualizar_ruta.bat` (o ejecútalo y pega la ruta
-   cuando la pida). Esto genera `data/latest.json` local con los datos del día.
-3. Corre `publicar_datos.bat`. Copia ese archivo al repo privado
-   `mapa-rutas-datos` y lo sube.
+1. Pega la descarga del sistema en la hoja **SABANA DE VENTA** del maestro
+   fijo **`BASE\RUTAS DIARIAS CAMIONES - MY MAPS.xlsx`** (siempre el mismo
+   archivo; también se abre con el botón "Abrir en Excel" de la ventana) y
+   **guarda**. Ya no hace falta actualizar la tabla dinámica de "dia", ni
+   pegar en RESUMEN, ni separar por chofer a mano, ni crear la carpeta del día.
+2. Doble clic en el acceso directo **"Actualizar Ruta"** del escritorio (o en
+   `ACTUALIZAR RUTA.bat`). Se abre una ventana que:
+   - Toma el maestro fijo de `BASE\`. Si no existiera, toma el archivo base
+     más reciente de las carpetas del día en OneDrive
+     (`MAPAS DIARIOS\<año>\<mes>\<día>`). Se puede usar otro con "Cambiar
+     archivo...". Funciona aunque el Excel esté abierto.
+   - Propone la fecha de liquidación más reciente. Si es **sábado**, marca
+     también el **viernes** (se juntan). Se pueden marcar otras fechas.
+   - Lista los camiones de esa fecha con sus clientes y total. Se tocan
+     para desmarcar los que no van al mapa — eso se **recuerda** para la
+     próxima vez. Los camiones nuevos salen en amarillo.
+   - Si un camión tiene **2 cargues** (2 números de liquidación), sale en
+     celeste con sus N° de liquidación; tocando su columna "Cargues" se
+     elige **Unificado** (un solo mapa, como siempre) o **Separados**
+     (`F325 CARGUE 1 - Liq 238` y `F325 CARGUE 2 - Liq 239`, numerados por
+     N° de liquidación de menor a mayor, cada uno con su Excel y su ruta en
+     el mapa).
+3. **"Generar y publicar en el mapa"**: crea los `MAPA Fxxx.xlsx`
+   (idénticos a los que salían de la tabla dinámica) en
+   `BASE\MAPAS\<fecha> <DÍA>` — o junto al archivo base si se usó otro — y
+   publica la ruta (archiva la anterior en el historial, igual
+   que `publicar_datos.bat`). "Solo generar Excel" hace lo primero sin
+   publicar.
 4. Los choferes abren siempre el mismo link (arriba) y ven la ruta
    actualizada, sin instalar ni configurar nada (salvo pegar el código de
    acceso la primera vez).
 
-También se puede correr todo a mano:
+### Método anterior (sigue funcionando)
+
+Con los `MAPA F1xx.xlsx` ya hechos en una carpeta: arrastra esa carpeta
+sobre `actualizar_ruta.bat` (genera `data/latest.json`) y después corre
+`publicar_datos.bat`. O a mano:
 ```
 python convertir.py "C:\RUTAS DIARIAS\15MARTES 15"
 ```
@@ -119,9 +183,16 @@ python convertir.py "C:\RUTAS DIARIAS\15MARTES 15"
 
 - `index.html`, `app.js`, `style.css` — el visor del mapa (selector de camión,
   mapa, pantalla de código de acceso).
+- `control_rutas.py` — el Excel de control (histórico, ubicaciones, cambios
+  de ruta); lo usa la ventana.
+- `ACTUALIZAR RUTA.bat` + `generar_rutas.py` — la ventana del uso diario:
+  lee la hoja SABANA DE VENTA, arma lo mismo que la tabla dinámica de "dia"
+  (agrupa por Fecha Liq, Chofer, N° Liq, vendedor, cliente... y suma Peso,
+  VentaNeta y Total), genera los MAPA y publica.
 - `convertir.py` — convierte los `MAPA F1xx.xlsx` del día a `data/latest.json`.
-- `data/latest.json` — datos del día actual, solo en esta computadora
-  (está en `.gitignore`, nunca se sube a este repo público).
+- `data/` — solo en esta computadora (está en `.gitignore`, nunca se sube a
+  este repo público): `latest.json` (datos del día), `generador_config.json`
+  (último archivo base y camiones desmarcados) y `generador_error.log`.
 - `actualizar_ruta.bat` — genera `data/latest.json` desde la carpeta del día.
 - `publicar_datos.bat` — combina con GitHub, archiva la ruta anterior en
   `historial/` si cambió la fecha, y sube la nueva a `mapa-rutas-datos`.

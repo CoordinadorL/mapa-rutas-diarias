@@ -1,7 +1,33 @@
+# Este repo es PUBLICO (GitHub Pages). Funciona como LISTA BLANCA: se
+# ignora todo y solo se permiten los archivos del programa listados abajo.
+# Asi un Excel, CSV o JSON con datos reales de clientes que se deje en esta
+# carpeta (maestro, SABANA, MAPA Fxxx, latest.json, historial...) nunca se
+# sube por error. Si agregas un archivo nuevo al programa, agregalo aqui.
+/*
+!/.gitignore
+!/index.html
+!/app.js
+!/style.css
+!/sw.js
+!/*.py
+!/*.bat
+!/README.md
+!/TOKEN.md
+
+!/.claude/
+/.claude/*
+!/.claude/launch.json
+
+# data/ es local (ruta del dia, configuracion del generador, registro de
+# errores); solo se sube la carpeta vacia.
+!/data/
+/data/*
+!/data/.gitkeep
+
 __pycache__/
 *.pyc
-data/latest.json
+~$*
 
-# Notas con codigos/tokens: nunca deben subirse a este repo publico.
+# Notas con codigos/tokens: nunca deben subirse.
 DATOS DE GITHUB.txt
 *.txt

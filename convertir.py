@@ -38,6 +38,15 @@ PALETA_COLORES = [
     "#9A6324",  # cafe
     "#800000",  # guinda
     "#bfef45",  # verde lima
+    # Solo para camiones con mas de 10 vendedores (pasa ~1 vez al mes).
+    "#42d4f4",  # celeste
+    "#469990",  # verde azulado
+    "#808000",  # oliva
+    "#000075",  # azul marino
+    "#ffe119",  # amarillo
+    "#fabed4",  # rosado
+    "#a9a9a9",  # gris
+    "#dcbeff",  # lila
 ]
 
 
@@ -90,18 +99,7 @@ def leer_archivo_camion(ruta: Path):
         if fecha_liq is None and fila[idx["Fecha Liq"]]:
             fecha_liq = fila[idx["Fecha Liq"]]
 
-        clientes.append({
-            "codigo": fila[idx["CodigoCliente"]],
-            "nombre": (fila[idx["Razon"]] or "").strip(),
-            "direccion": (fila[idx["Direccion"]] or "").strip(),
-            "canal": (fila[idx["canal"]] or "").strip(),
-            "vendedor": (fila[idx["vendedor"]] or "").strip(),
-            "lat": float(lat),
-            "lng": float(lng),
-            "peso": fila[idx["Suma de Peso"]],
-            "venta": fila[idx["Suma de VentaNeta"]],
-            "total": fila[idx["Suma de Total"]],
-        })
+        clientes.append(cliente_desde_fila(dict(zip(COLUMNAS_ESPERADAS, (fila[idx[c]] for c in COLUMNAS_ESPERADAS)))))
 
     if not clientes:
         return None
@@ -113,6 +111,28 @@ def leer_archivo_camion(ruta: Path):
         "chofer": chofer,
         "fecha_liq": fecha_liq,
         "clientes": clientes,
+    }
+
+
+def texto(valor) -> str:
+    return "" if valor is None else str(valor).strip()
+
+
+def cliente_desde_fila(fila: dict) -> dict:
+    """Un cliente del JSON del mapa a partir de una fila con las columnas de
+    COLUMNAS_ESPERADAS (la usa tambien generar_rutas.py, para que los dos
+    caminos produzcan exactamente el mismo formato)."""
+    return {
+        "codigo": fila["CodigoCliente"],
+        "nombre": texto(fila["Razon"]),
+        "direccion": texto(fila["Direccion"]),
+        "canal": texto(fila["canal"]),
+        "vendedor": texto(fila["vendedor"]),
+        "lat": float(fila["latitud_y"]),
+        "lng": float(fila["longitud_x"]),
+        "peso": fila["Suma de Peso"],
+        "venta": fila["Suma de VentaNeta"],
+        "total": fila["Suma de Total"],
     }
 
 

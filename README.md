@@ -160,6 +160,21 @@ copia vieja guardada.
      (`F325 CARGUE 1 - Liq 238` y `F325 CARGUE 2 - Liq 239`, numerados por
      N° de liquidación de menor a mayor, cada uno con su Excel y su ruta en
      el mapa).
+   - **Todos los clientes deben tener ubicación (georreferencia).** Si a
+     algún cliente de los camiones marcados le falta (sin coordenadas, 0,0 o
+     fuera de Ecuador, y sin corrección), sale primero una **lista en rojo**
+     arriba de los camiones (transportista, código, cliente, dirección,
+     vendedor) y **"Generar y publicar" queda bloqueado** hasta corregirlos.
+     Para corregir: elegir el cliente → **"1. Buscar en Google Maps"** (abre
+     el mapa buscando el local) → clic derecho sobre el local → clic en los
+     números (se copian) → **"2. Pegar ubicación copiada"** (se guarda al
+     momento, igual que arrastrar el punto en el mapa). Para varios a la vez:
+     "Varios: Excel de control" los pone arriba en UBICACIONES (filas en
+     rojo); se pega la coordenada, se guarda y la lista se actualiza sola.
+     "Copiar lista para vendedores" la deja lista para WhatsApp, agrupada por
+     vendedor. Las correcciones se revisan contra lo vigente en GitHub
+     (incluidas las hechas arrastrando en el mapa); sin internet se usa lo
+     último descargado y se avisa.
 3. **"Generar y publicar en el mapa"**: crea los `MAPA Fxxx.xlsx`
    (idénticos a los que salían de la tabla dinámica) en
    `BASE\MAPAS\<fecha> <DÍA>` — o junto al archivo base si se usó otro — y
@@ -190,9 +205,12 @@ también se sube a My Maps, como se hacía a mano. Ventana **My Maps** (botón
   colores de My Maps, alternando para que no se confundan) y etiquetas con la
   **Razón**; todas las capas desmarcadas; compartido "cualquiera con el
   enlace" y **sin** búsqueda pública.
-- Las ubicaciones van **corregidas** (las mismas del mapa web). Los
-  clientes sin ubicación que sirva no se suben (una sola celda vacía hace que
-  My Maps no reconozca la columna de latitud); siguen en su Excel MAPA.
+- Las ubicaciones van **corregidas** (las mismas del mapa web). Antes de
+  abrir Chrome se revisa que **todos** los clientes tengan ubicación, con la
+  misma regla del mapa web: si falta alguno, no se sube y se muestra la lista
+  (hay que corregirlo en "Actualizar ruta" y volver a publicar). Se suben
+  solo los MAPA que se publicaron (`_publicado.json` en la carpeta del día),
+  no un Excel suelto de "Solo generar Excel".
 - Abajo, los **links de los últimos 30 días** por fecha de entrega:
   "Copiar link", "Copiar mensaje del día" (título + transportistas + link de
   cada mapa, para WhatsApp) y "Abrir en el navegador". Al terminar de subir,

@@ -41,6 +41,16 @@ def minutos(planes) -> int:
     return max(1, round((capas * SEGUNDOS_POR_CAPA + len(planes) * SEGUNDOS_POR_MAPA) / 60))
 
 
+def revisar_carpeta(carpeta: Path):
+    """Revision antes de subir: MAPA que cambiaron despues de publicar, y
+    clientes sin georreferencia (con las correcciones vigentes en GitHub).
+    Devuelve (faltan, al_dia, cambiados)."""
+    import generar_rutas
+    cambiados = mymaps.cambiados_desde_publicar(carpeta)
+    overrides, al_dia = generar_rutas.overrides_vigentes()
+    return mymaps.revisar_georef(mymaps.archivos_mapa(carpeta), overrides), al_dia, cambiados
+
+
 def carpetas_del_dia():
     """Carpetas BASE\\MAPAS\\<fecha DIA> con archivos MAPA, la mas nueva primero."""
     if not CARPETA_MAPAS.is_dir():
@@ -85,6 +95,10 @@ class VentanaMyMaps:
         self.carpetas = []
         self.fechas_entrega = []
         self.planes = []
+        # Revision de georreferencia de la carpeta elegida (en segundo plano):
+        # hasta que diga "ok" no se puede subir.
+        self.georef = {"carpeta": None, "estado": "revisando", "faltan": [], "al_dia": True}
+        self.revision_n = 0
         self.escala = max(1.0, ventana.winfo_fpixels("1i") / 96)
         self.construir()
         self.cargar_carpetas(carpeta)
@@ -154,9 +168,17 @@ class VentanaMyMaps:
         self.lista_planes.grid(row=0, column=0, sticky="ew")
         self.lbl_aviso = ttk.Label(m1, text="", foreground="#a15c00", wraplength=self.px(780))
         self.lbl_aviso.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        marco_geo = ttk.Frame(m1)
+        marco_geo.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        marco_geo.columnconfigure(0, weight=1)
+        self.lbl_georef = tk.Label(marco_geo, text="", anchor="w", justify="left", wraplength=self.px(680),
+                                   font=("Segoe UI", 9, "bold"))
+        self.lbl_georef.grid(row=0, column=0, sticky="w")
+        self.btn_revisar = ttk.Button(marco_geo, text="Revisar de nuevo", command=lambda: self.revisar_georef())
+        self.btn_revisar.grid(row=0, column=1, sticky="ne", padx=(6, 0))
 
         barra = ttk.Frame(m1)
-        barra.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        barra.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.btn_subir = ttk.Button(barra, text="Subir a My Maps", style="Accion.TButton", command=self.subir)
         self.btn_subir.pack(side="right")
         self.btn_cancelar = ttk.Button(barra, text="Cancelar", command=self.pedir_cancelar, state="disabled")
@@ -208,9 +230,17 @@ class VentanaMyMaps:
         self.txt.see("end")
         self.txt.config(state="disabled")
 
+    def estado_subir(self):
+        """Subir solo si hay mapas, no se esta subiendo, y la revision de la
+        carpeta elegida dijo que TODOS los clientes tienen georreferencia."""
+        listo = (not self.trabajando and bool(self.planes) and self.georef["estado"] == "ok"
+                 and self.georef["carpeta"] == self.carpeta_actual())
+        self.btn_subir.config(state="normal" if listo else "disabled")
+        self.btn_revisar.config(state="disabled" if self.trabajando else "normal")
+
     def ocupar(self, ocupado, mensaje=""):
         self.trabajando = ocupado
-        self.btn_subir.config(state="disabled" if ocupado or not self.planes else "normal")
+        self.estado_subir()
         self.btn_cancelar.config(state="normal" if ocupado else "disabled")
         for cmb in (self.cmb_carpeta, self.cmb_entrega):
             cmb.config(state="disabled" if ocupado else "readonly")
@@ -246,6 +276,19 @@ class VentanaMyMaps:
         if tipo == "log":
             self.log(datos[0])
             return
+        if tipo == "georef":
+            # Resultado de la revision en segundo plano: no es el fin de una
+            # subida (no toca "trabajando"). Se ignora si ya es de otra carpeta
+            # o hubo una revision mas nueva.
+            n, carpeta, faltan, al_dia, error, cambiados = datos
+            if n == self.revision_n:
+                self.georef = {"carpeta": carpeta, "faltan": faltan or [], "al_dia": al_dia, "error": error,
+                               "cambiados": cambiados or [],
+                               "estado": "error" if error else ("faltan" if faltan else
+                                                                ("cambiados" if cambiados else "ok"))}
+                self.pintar_georef()
+                self.estado_subir()
+            return
         self.ocupar(False)
         self.pintar_links()
         if self.cerrar_al_terminar:
@@ -265,6 +308,7 @@ class VentanaMyMaps:
             self.refrescar_planes()
             self.lbl_estado.config(text="No se completó, revisa el mensaje.")
             self.log("ERROR: " + datos[0])
+            self.revisar_georef()       # por si el problema fue de ubicaciones: que se vea abajo
             self.messagebox.showerror("My Maps", datos[0], parent=self.v)
 
     def copiar(self, texto):
@@ -307,6 +351,48 @@ class VentanaMyMaps:
         self.cmb_entrega.config(values=[mymaps.fecha_larga(d) for d in self.fechas_entrega])
         self.cmb_entrega.current(self.fechas_entrega.index(mymaps.entrega_sugerida(liq)))
         self.refrescar_planes()
+        self.revisar_georef()
+
+    def revisar_georef(self):
+        carpeta = self.carpeta_actual()
+        if not carpeta or self.trabajando:
+            return
+        self.revision_n += 1
+        n = self.revision_n
+        self.georef = {"carpeta": carpeta, "estado": "revisando", "faltan": [], "al_dia": True}
+        self.pintar_georef()
+        self.estado_subir()
+
+        def revisar():
+            try:
+                faltan, al_dia, cambiados = revisar_carpeta(carpeta)
+                self.cola.put(("georef", n, carpeta, faltan, al_dia, None, cambiados))
+            except Exception as e:
+                registrar_error(traceback.format_exc())
+                self.cola.put(("georef", n, carpeta, None, False, str(e) or type(e).__name__, None))
+        threading.Thread(target=revisar, daemon=True).start()
+
+    def pintar_georef(self):
+        g = self.georef
+        if g["estado"] == "revisando":
+            texto, color = "Revisando que todos los clientes tengan ubicación...", "#666666"
+        elif g["estado"] == "error":
+            texto, color = (f"No se pudo revisar la ubicación de los clientes: {g.get('error')}. "
+                            "Revisa que los archivos MAPA no estén abiertos y dale a \"Revisar de nuevo\"."), "#b00020"
+        elif g["estado"] == "faltan":
+            faltan = g["faltan"]
+            from generar_rutas import texto_sin_georef
+            texto = (f"✗ {len(faltan)} clientes SIN ubicación (todos deben tenerla para subir):\n"
+                     f"{texto_sin_georef(faltan, maximo=6)}\nCorrígelos en \"Actualizar ruta\" (lista en rojo), "
+                     "vuelve a \"Generar y publicar\" y después súbelo aquí.")
+            color = "#b00020"
+        elif g["estado"] == "cambiados":
+            texto, color = "✗ " + mymaps.texto_cambiados(g["cambiados"]), "#b00020"
+        else:
+            texto, color = "✓ Todos los clientes tienen ubicación.", "#1b7a2f"
+        if g["estado"] in ("ok", "faltan") and not g.get("al_dia", True):
+            texto += "  (Sin conexión con GitHub: revisado con las correcciones de esta PC.)"
+        self.lbl_georef.config(text=texto, fg=color)
 
     def entrega_actual(self):
         i = self.cmb_entrega.current()
@@ -332,8 +418,7 @@ class VentanaMyMaps:
             if entrega < date.today():
                 avisos.append("OJO: la fecha de entrega ya pasó.")
         self.lbl_aviso.config(text="  ".join(avisos))
-        if not self.trabajando:
-            self.btn_subir.config(state="normal" if self.planes else "disabled")
+        self.estado_subir()
 
     # -- subir ----------------------------------------------------------------------
     def subir(self):
@@ -378,7 +463,10 @@ class VentanaMyMaps:
         except Exception as e:
             detalle = traceback.format_exc()
             registrar_error(detalle)
-            if type(e).__module__.startswith("playwright"):
+            if type(e).__name__ == "ErrorRuta":
+                # Mensaje ya pensado para el usuario (de generar_rutas).
+                self.cola.put(("error", str(e)))
+            elif type(e).__module__.startswith("playwright"):
                 self.cola.put(("error", "My Maps no respondió como se esperaba (puede que Google haya cambiado "
                                         "algo en la página o que se haya cerrado el Chrome del robot).\n\n"
                                         "Vuelve a intentar; si se repite, súbelo a mano con los archivos de la "

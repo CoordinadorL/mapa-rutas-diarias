@@ -83,6 +83,9 @@ assert COLUMNAS_ESPERADAS == CAMPOS_GRUPO + ["Suma de " + c for c in CAMPOS_SUMA
 
 DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 FECHAS_A_MOSTRAR = 6
+# Cada cuanto se mira si se guardo el Excel de control (para que la lista de
+# clientes sin georreferencia se actualice sola al corregirlos).
+SEGUNDOS_VIGILANCIA = 3
 
 
 class ErrorRuta(Exception):
@@ -525,6 +528,78 @@ def en_ecuador(lat, lng) -> bool:
     return LAT_MIN <= lat <= LAT_MAX and LNG_MIN <= lng <= LNG_MAX
 
 
+# ---------------------------------------------------------------------------
+# Georreferencia: UNA sola regla para el mapa web, los MAPA y My Maps
+# ---------------------------------------------------------------------------
+
+MOTIVOS_SIN_GEO = {"sin_coordenadas": "sin coordenadas",
+                   "fuera_de_ecuador": "coordenada en 0,0 o fuera de Ecuador"}
+
+
+def codigo_texto(valor) -> str:
+    """Codigo de cliente como texto ('1234567'), venga como numero o texto
+    (igual que las claves de overrides.json)."""
+    if valor is None:
+        return ""
+    if isinstance(valor, float) and valor.is_integer():
+        valor = int(valor)
+    s = str(valor).strip()
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".")[0]
+    return s
+
+
+def correccion_valida(overrides: dict, codigo):
+    """(lat, lng) de la correccion de ubicacion del cliente, si hay una que
+    sirva (numeros dentro de Ecuador); si no, None."""
+    ajuste = (overrides or {}).get(codigo_texto(codigo))
+    if isinstance(ajuste, dict) and es_numero(ajuste.get("lat")) and es_numero(ajuste.get("lng")) \
+            and en_ecuador(ajuste["lat"], ajuste["lng"]):
+        return float(ajuste["lat"]), float(ajuste["lng"])
+    return None
+
+
+def problema_de_ubicacion(lat_valor, lng_valor):
+    """None si la coordenada del sistema sirve; si no, la clave del motivo."""
+    lat, lng = a_coordenada(lat_valor), a_coordenada(lng_valor)
+    if lat is None or lng is None:
+        return "sin_coordenadas"
+    if not en_ecuador(lat, lng):
+        return "fuera_de_ecuador"
+    return None
+
+
+def clientes_sin_georef(camiones, overrides):
+    """Clientes de esos camiones que no tienen ubicacion valida ni en el
+    sistema ni en las correcciones: uno por codigo, con todos los
+    transportistas donde sale. Es la misma regla de armar_json (si aqui no
+    sale nadie, en el mapa sale todo el mundo)."""
+    por_codigo = {}
+    for camion in camiones:
+        for fila in camion["filas"]:
+            problema = problema_de_ubicacion(fila.get("latitud_y"), fila.get("longitud_x"))
+            if not problema or correccion_valida(overrides, fila.get("CodigoCliente")):
+                continue
+            codigo = codigo_texto(fila.get("CodigoCliente"))
+            item = por_codigo.setdefault(codigo, {
+                "codigo": codigo, "nombre": texto(fila.get("Razon")), "direccion": texto(fila.get("Direccion")),
+                "vendedores": [], "rutas": [], "choferes": [], "motivo": MOTIVOS_SIN_GEO[problema]})
+            for clave, valor in (("rutas", camion["id"]), ("choferes", nombre_chofer(camion["chofer"])),
+                                 ("vendedores", texto(fila.get("vendedor")))):
+                if valor and valor not in item[clave]:
+                    item[clave].append(valor)
+    return sorted(por_codigo.values(), key=lambda c: (c["rutas"][0] if c["rutas"] else "", c["codigo"]))
+
+
+def texto_sin_georef(faltan, maximo=12) -> str:
+    """Lista corta para un mensaje: 'F150 · 1234567 TIENDA X (sin coordenadas)'."""
+    lineas = [f"• {', '.join(c['rutas'])} · {c['codigo']} {c['nombre'][:30]} ({c['motivo']})"
+              for c in faltan[:maximo]]
+    if len(faltan) > maximo:
+        lineas.append(f"... y {len(faltan) - maximo} más")
+    return "\n".join(lineas)
+
+
 def armar_json(camiones, fechas, overrides=None):
     """Mismo formato que produce convertir.py desde los MAPA. Devuelve
     tambien los avisos de clientes que no pueden salir en el mapa.
@@ -541,23 +616,17 @@ def armar_json(camiones, fechas, overrides=None):
         clientes = []
         for fila in camion["filas"]:
             lat, lng = a_coordenada(fila["latitud_y"]), a_coordenada(fila["longitud_x"])
-            problema = None
-            if lat is None or lng is None:
-                problema = "sin_coordenadas"
-            elif not en_ecuador(lat, lng):
-                problema = "fuera_de_ecuador"
+            problema = problema_de_ubicacion(fila["latitud_y"], fila["longitud_x"])
             if problema:
-                ajuste = overrides.get(str(fila["CodigoCliente"]).strip())
-                if isinstance(ajuste, dict) and es_numero(ajuste.get("lat")) and es_numero(ajuste.get("lng")) \
-                        and en_ecuador(ajuste["lat"], ajuste["lng"]):
-                    lat, lng = float(ajuste["lat"]), float(ajuste["lng"])
+                ajuste = correccion_valida(overrides, fila["CodigoCliente"])
+                if ajuste:
+                    lat, lng = ajuste
                 else:
                     avisos[problema].append((camion["id"], fila["CodigoCliente"]))
                     sin_ubicacion.append({
                         "codigo": fila["CodigoCliente"], "nombre": texto(fila["Razon"]), "ruta": camion["id"],
-                        "vendedor": texto(fila["vendedor"]), "direccion": texto(fila["Direccion"]),
-                        "motivo": "sin coordenadas" if problema == "sin_coordenadas"
-                        else "coordenada en 0,0 o fuera de Ecuador"})
+                        "chofer": camion["chofer"], "vendedor": texto(fila["vendedor"]),
+                        "direccion": texto(fila["Direccion"]), "motivo": MOTIVOS_SIN_GEO[problema]})
                     continue
             cliente = cliente_desde_fila({**fila, "latitud_y": lat, "longitud_x": lng})
             if problema:
@@ -715,6 +784,22 @@ def descartar_intentos_viejos(log, con_ruta):
         raise ErrorRuta(f"No pude dejar la carpeta de datos igual a GitHub.\n{NO_PUBLICADO} Avisa.")
 
 
+def ruta_sin_subir() -> bool:
+    """Si quedo guardada (commit) una ruta que no llego a GitHub. Solo mira lo
+    local (sin red): es para avisar antes de intentar subir una ubicacion
+    sola, que en ese caso descartar_intentos_viejos no deja."""
+    if not (REPO_DATOS / ".git").is_dir():
+        return False
+    try:
+        with BLOQUEO_GIT:
+            if not commits_sin_subir():
+                return False
+            _, nombres = correr_git(["diff", "--name-only", "origin/main", "HEAD"], None)
+    except (ErrorRuta, OSError):
+        return False
+    return any(n.strip() == "latest.json" or n.strip().startswith("historial/") for n in nombres.splitlines())
+
+
 def commits_sin_subir() -> int:
     codigo, salida = correr_git(["rev-list", "--count", "origin/main..HEAD"], None)
     return int(salida) if codigo == 0 and salida.isdigit() else 1
@@ -759,12 +844,95 @@ def overrides_locales(cambios_pendientes=()):
         actual = json.loads((REPO_DATOS / "overrides.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         actual = {}
+    return con_pendientes(actual, cambios_pendientes)
+
+
+def pendientes_aplicables(base: dict, cambios_pendientes=()):
+    """Los cambios del Excel de control que de verdad se van a aplicar sobre
+    `base` (misma condicion que control_rutas.aplicar_ubicaciones_en_archivo:
+    los que chocan con algo cambiado en el mapa quedan en Conflicto y no se
+    aplican). Devuelve (aplicables, en_conflicto)."""
+    import control_rutas
+    aplicables, conflicto = [], []
+    for c in cambios_pendientes:
+        hoy = control_rutas._como_par((base or {}).get(c["codigo"]))
+        objetivo = None if c["accion"] == "quitar" else [round(c["lat"], 7), round(c["lng"], 7)]
+        if control_rutas._mismo_punto(hoy, objetivo) or control_rutas._mismo_punto(hoy, c.get("antes")):
+            aplicables.append(c)
+        else:
+            conflicto.append(c)
+    return aplicables, conflicto
+
+
+def con_pendientes(overrides: dict, cambios_pendientes=()):
+    actual = dict(overrides) if isinstance(overrides, dict) else {}
     for c in cambios_pendientes:
         if c["accion"] == "quitar":
             actual.pop(c["codigo"], None)
         else:
             actual[c["codigo"]] = {"lat": c["lat"], "lng": c["lng"]}
     return actual
+
+
+# Un solo comando de git a la vez sobre el repo de datos dentro de este
+# programa (la ventana de My Maps puede consultar mientras se publica).
+BLOQUEO_GIT = threading.RLock()
+# Las consultas automaticas bajan lo de GitHub a esta referencia propia (no a
+# origin/main ni FETCH_HEAD), asi nunca chocan con el pull de una publicacion
+# que este corriendo en otra ventana.
+REF_VIGENTE = "refs/mrd/vigente"
+SEGUNDOS_CONSULTA = 30
+
+
+def git_silencioso(argumentos, tiempo=SEGUNDOS_CONSULTA) -> bool:
+    """git para consultas automaticas: nunca abre ventanas ni pide usuario o
+    clave, y al vencer el tiempo corta de verdad (mata todo el arbol de
+    procesos; un subprocess.run con timeout puede quedar esperando a
+    git-remote-https). Devuelve True si salio bien."""
+    sin_ventana = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    entorno = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+    try:
+        p = subprocess.Popen(["git", "-c", "gc.auto=0", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10",
+                              *argumentos], cwd=REPO_DATOS, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=entorno, creationflags=sin_ventana)
+    except OSError:
+        return False
+    try:
+        return p.wait(timeout=tiempo) == 0
+    except subprocess.TimeoutExpired:
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True, timeout=15,
+                           creationflags=sin_ventana)
+        except (OSError, subprocess.TimeoutExpired):
+            p.kill()
+        return False
+
+
+def overrides_vigentes(cambios_pendientes=()):
+    """Las correcciones de ubicacion que hay HOY en GitHub (las del arrastre
+    en el mapa llegan alli directo, sin pasar por esta PC) mas las pendientes
+    del Excel de control. No toca los archivos de la carpeta de datos ni sus
+    ramas. Devuelve (overrides, al_dia); sin internet usa lo ultimo
+    descargado y al_dia es False."""
+    al_dia, actual = False, None
+    if (REPO_DATOS / ".git").is_dir():
+        import control_rutas
+        with BLOQUEO_GIT:
+            # --refmap= : sin esto git tambien mueve origin/main ("actualizacion
+            # oportunista") y podria chocar con el pull de una publicacion.
+            al_dia = git_silencioso(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance",
+                                     "--refmap=", "origin", f"+refs/heads/main:{REF_VIGENTE}"])
+            for ref in ((REF_VIGENTE,) if al_dia else ()) + ("origin/main", "HEAD"):
+                try:
+                    blob = control_rutas.leer_blobs(ref, ["overrides.json"]).get("overrides.json")
+                    if blob is not None:
+                        actual = json.loads(blob)
+                        break
+                except (ErrorRuta, ValueError, OSError):
+                    pass
+    if not isinstance(actual, dict):
+        return overrides_locales(cambios_pendientes), False
+    return con_pendientes(actual, cambios_pendientes), al_dia
 
 
 def fecha_publicada():
@@ -784,7 +952,11 @@ def publicar(log, con_ruta=True, ubicaciones=None):
     publicado). Devuelve los estados de las ubicaciones."""
     if not (REPO_DATOS / ".git").is_dir():
         raise ErrorRuta(f"No encuentro la carpeta del repo de datos ({REPO_DATOS}).")
+    with BLOQUEO_GIT:
+        return _publicar(log, con_ruta, ubicaciones)
 
+
+def _publicar(log, con_ruta, ubicaciones):
     preparar_repo(log)
     log("Combinando con GitHub...")
     descartar_intentos_viejos(log, con_ruta)
@@ -881,6 +1053,29 @@ def revisar_cerrados(rutas) -> None:
                             "(No se cambió ningún archivo.)")
 
 
+ARCHIVO_PUBLICADO = "_publicado.json"
+
+
+def huella_archivo(ruta: Path) -> str:
+    import hashlib
+    return hashlib.sha256(ruta.read_bytes()).hexdigest()
+
+
+def anotar_publicado(carpeta: Path, archivos, fechas) -> None:
+    """Deja en la carpeta del dia cuales MAPA se publicaron y su huella: My
+    Maps sube exactamente esos y avisa si alguno cambio despues (por ejemplo,
+    con "Solo generar Excel"), para que suba lo mismo que tiene el mapa web."""
+    try:
+        (carpeta / ARCHIVO_PUBLICADO).write_text(json.dumps({
+            "archivos": sorted(p.name for p in archivos),
+            "huellas": {p.name: huella_archivo(p) for p in archivos if p.exists()},
+            "fechas": sorted(d.isoformat() for d in fechas),
+            "publicado": datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+    except OSError:
+        registrar_error(traceback.format_exc())
+
+
 def mapas_viejos(carpeta: Path):
     """MAPA de una generacion anterior del mismo dia, solo en la carpeta
     por fecha del maestro fijo (que es exclusiva de este programa)."""
@@ -921,11 +1116,22 @@ def abrir_ventana():
             self.carpeta_ultima = None
             self.nota_sabado = False
             self.ocupado = False
+            # Correcciones de ubicacion (sin las pendientes del Excel de
+            # control): se traen de GitHub al leer el maestro y despues de
+            # publicar. Con ellas se calcula quien no tiene georreferencia.
+            self.overrides_base = overrides_locales()
+            self.overrides_al_dia = False
+            self.sin_georef = []
+            self.overrides_listos = False
+            self.leyendo_control = False
+            self.fallos_vigilancia = 0
+            self.pausar_vigilancia = False
             # Medidas pensadas a 100% de escala de Windows; se agrandan solas
             # si la pantalla esta al 125%/150% para que nada quede apretado.
             self.escala = max(1.0, raiz.winfo_fpixels("1i") / 96)
             self.construir()
             raiz.after(100, self.revisar_cola)
+            raiz.after(SEGUNDOS_VIGILANCIA * 1000, self.vigilar_control)
 
             base = buscar_base_reciente(self.config)
             if base:
@@ -991,8 +1197,9 @@ def abrir_ventana():
 
             marco_lista = ttk.Frame(m3)
             marco_lista.pack(fill="both", expand=True, pady=(6, 0))
+            self.marco_lista = marco_lista
             columnas = ("incluir", "camion", "chofer", "liq", "clientes", "total", "cargues")
-            self.lista = ttk.Treeview(marco_lista, columns=columnas, show="headings", selectmode="none")
+            self.lista = ttk.Treeview(marco_lista, columns=columnas, show="headings", selectmode="none", height=8)
             for col, titulo, ancho, ancla in [("incluir", "", 36, "center"), ("camion", "Camión", 64, "w"),
                                               ("chofer", "Chofer", 230, "w"), ("liq", "N° Liq.", 90, "w"),
                                               ("clientes", "Clientes", 64, "e"), ("total", "Total", 96, "e"),
@@ -1002,6 +1209,7 @@ def abrir_ventana():
             self.lista.tag_configure("fuera", foreground="#9a9a9a")
             self.lista.tag_configure("nuevo", background="#fff4cc")
             self.lista.tag_configure("varios", background="#e6f0ff")
+            self.lista.tag_configure("singeo", foreground="#b00020")
             barra_v = ttk.Scrollbar(marco_lista, orient="vertical", command=self.lista.yview)
             self.lista.configure(yscrollcommand=barra_v.set)
             self.lista.pack(side="left", fill="both", expand=True)
@@ -1009,11 +1217,52 @@ def abrir_ventana():
             self.lista.bind("<Button-1>", self.click_lista)
             # Sin esto, un doble clic marca y desmarca (parece que no hizo nada).
             self.lista.bind("<Double-Button-1>", lambda evento: "break")
-            ttk.Label(m3, text="Toca un camión para marcarlo o desmarcarlo; lo que desmarques se recuerda "
-                               "para la próxima vez (los camiones nuevos salen en amarillo). Los que tienen "
-                               "2 cargues (2 N° de liquidación) salen en celeste: toca su columna \"Cargues\" "
-                               "para elegir unificado o separados.",
-                      style="Ayuda.TLabel", wraplength=self.px(820)).pack(anchor="w", pady=(6, 0))
+            self.lbl_ayuda_camiones = ttk.Label(
+                m3, text="Toca un camión para marcarlo o desmarcarlo; lo que desmarques se recuerda "
+                         "para la próxima vez (los camiones nuevos salen en amarillo). Los que tienen "
+                         "2 cargues (2 N° de liquidación) salen en celeste: toca su columna \"Cargues\" "
+                         "para elegir unificado o separados.",
+                style="Ayuda.TLabel", wraplength=self.px(820))
+            self.lbl_ayuda_camiones.pack(anchor="w", pady=(6, 0))
+
+            # Clientes SIN ubicacion (georreferencia) de los camiones marcados:
+            # se ven primero, arriba de la lista, y no se puede publicar hasta
+            # corregirlos (todos deben tenerla). Solo aparece cuando hay alguno.
+            # (Se crea despues de la lista de camiones para no cambiar el orden
+            # de los widgets; con pack(before=...) queda arriba de ella.)
+            estilo.configure("Alerta.TLabelframe.Label", foreground="#b00020", font=("Segoe UI", 10, "bold"))
+            estilo.configure("Alerta.TLabel", foreground="#b00020", font=("Segoe UI", 10, "bold"))
+            self.marco_geo = ttk.LabelFrame(m3, text="", padding=6, style="Alerta.TLabelframe")
+            self.lbl_geo = ttk.Label(self.marco_geo, text="", wraplength=self.px(820))
+            self.lbl_geo.pack(anchor="w")
+            tabla_geo = ttk.Frame(self.marco_geo)
+            tabla_geo.pack(fill="x", pady=(4, 0))
+            self.lista_geo = ttk.Treeview(tabla_geo, columns=("ruta", "codigo", "cliente", "direccion",
+                                                               "vendedor", "motivo"),
+                                          show="headings", height=3, selectmode="browse")
+            for col, titulo, ancho, estira in [("ruta", "Transportista", 110, False), ("codigo", "Código", 76, False),
+                                               ("cliente", "Cliente", 190, True), ("direccion", "Dirección", 210, True),
+                                               ("vendedor", "Vendedor", 70, False), ("motivo", "Motivo", 170, False)]:
+                self.lista_geo.heading(col, text=titulo, anchor="w")
+                self.lista_geo.column(col, width=self.px(ancho), anchor="w", stretch=estira)
+            barra_geo = ttk.Scrollbar(tabla_geo, orient="vertical", command=self.lista_geo.yview)
+            self.lista_geo.configure(yscrollcommand=barra_geo.set)
+            self.lista_geo.pack(side="left", fill="x", expand=True)
+            barra_geo.pack(side="right", fill="y")
+            self.lista_geo.bind("<Double-Button-1>", lambda e: self.buscar_en_maps())
+            botones_geo = ttk.Frame(self.marco_geo)
+            botones_geo.pack(fill="x", pady=(4, 0))
+            self.btn_buscar_geo = ttk.Button(botones_geo, text="1. Buscar en Google Maps",
+                                             command=self.buscar_en_maps)
+            self.btn_buscar_geo.pack(side="left")
+            self.btn_pegar_geo = ttk.Button(botones_geo, text="2. Pegar ubicación copiada",
+                                            command=self.pegar_ubicacion)
+            self.btn_pegar_geo.pack(side="left", padx=(6, 0))
+            self.btn_corregir_geo = ttk.Button(botones_geo, text="Varios: Excel de control",
+                                               command=self.abrir_control)
+            self.btn_corregir_geo.pack(side="left", padx=(18, 0))
+            ttk.Button(botones_geo, text="Copiar lista para vendedores",
+                       command=self.copiar_sin_georef).pack(side="left", padx=(6, 0))
 
             m4 = ttk.Frame(cont)
             m4.pack(fill="x", pady=(10, 0))
@@ -1029,7 +1278,8 @@ def abrir_ventana():
             self.btn_control.pack(side="left", padx=(8, 0))
             self.btn_ubicaciones = ttk.Button(m4, text="Aplicar ubicaciones", command=self.aplicar_ubicaciones)
             self.btn_ubicaciones.pack(side="left", padx=(8, 0))
-            ttk.Button(m4, text="My Maps", command=self.abrir_mymaps).pack(side="left", padx=(8, 0))
+            self.btn_mymaps = ttk.Button(m4, text="My Maps", command=self.abrir_mymaps)
+            self.btn_mymaps.pack(side="left", padx=(8, 0))
 
             m5 = ttk.Frame(cont)
             m5.pack(fill="x", pady=(10, 0))
@@ -1050,13 +1300,13 @@ def abrir_ventana():
         def ocupar(self, ocupado, mensaje=""):
             estado = "disabled" if ocupado else "normal"
             for b in (self.btn_cambiar, self.btn_releer, self.btn_todos, self.btn_ninguno,
-                      self.btn_publicar, self.btn_excel, self.btn_control, self.btn_ubicaciones):
+                      self.btn_publicar, self.btn_excel, self.btn_control, self.btn_ubicaciones,
+                      self.btn_corregir_geo, self.btn_pegar_geo, self.btn_mymaps):
                 b.config(state=estado)
             for chk in self.marco_fechas.winfo_children():
                 chk.config(state=estado)
-            if not ocupado and not self.camiones:
-                self.btn_publicar.config(state="disabled")
-                self.btn_excel.config(state="disabled")
+            if not ocupado:
+                self.estado_botones()
             self.lbl_estado.config(text=mensaje)
             if ocupado:
                 self.barra_progreso.pack(side="right")
@@ -1111,6 +1361,41 @@ def abrir_ventana():
                 self.base_leida(*datos)
             elif tipo == "control":
                 self.control_leido(*datos)
+            elif tipo == "control_vigilado":
+                self.leyendo_control = False
+                self.fallos_vigilancia = 0
+                # Durante una pregunta (publicar) no se cambia nada debajo: se
+                # vuelve a leer en la siguiente vuelta.
+                if not self.ocupado and not self.pausar_vigilancia:
+                    antes = len(self.sin_georef)
+                    self.control_leido(*datos)
+                    if antes != len(self.sin_georef):
+                        self.log(f"Excel de control releído: {len(self.sin_georef)} clientes sin georreferencia.")
+            elif tipo == "control_vigilado_fallo":
+                self.leyendo_control = False
+                self.fallos_vigilancia += 1
+                if self.fallos_vigilancia >= 3 and not self.ocupado:
+                    # Ya no es un guardado a medias: se lee como siempre (avisa
+                    # el motivo y sigue sin sus cambios).
+                    self.fallos_vigilancia = 0
+                    self.leyendo_control = True
+                    threading.Thread(target=lambda: self.cola.put(("control_vigilado",
+                                                                   self.leer_control_seguro())),
+                                     daemon=True).start()
+            elif tipo == "aviso":
+                self.ocupar(False, datos[0])
+                self.log(datos[0])
+            elif tipo == "overrides":
+                ya_estaban = self.overrides_listos
+                self.overrides_base, self.overrides_al_dia = datos
+                self.overrides_listos = True
+                if not datos[1]:
+                    self.log("Aviso: sin conexión con GitHub; para revisar la georreferencia se usan las "
+                             "correcciones de ubicación descargadas la última vez.")
+                if self.vars_fechas:
+                    self.pintar_lista()
+                    if not ya_estaban and not self.ocupado:
+                        self.lbl_estado.config(text=self.mensaje_listo())
             elif tipo == "confirmar_ubicaciones":
                 self.confirmar_ubicaciones(*datos)
             elif tipo == "abrir":
@@ -1120,6 +1405,8 @@ def abrir_ventana():
                 except OSError as e:
                     messagebox.showerror("Excel de control", f"No pude abrir el archivo:\n{datos[0]}\n\n{e}",
                                          parent=self.raiz)
+                if len(datos) > 2 and datos[2]:
+                    messagebox.showinfo("Excel de control", datos[2], parent=self.raiz)
             elif tipo == "fin":
                 self.ocupar(False, datos[0].splitlines()[0])
                 self.log(datos[0])
@@ -1172,6 +1459,11 @@ def abrir_ventana():
             self.lbl_resumen.config(text="")
             self.lista.delete(*self.lista.get_children())
             self.ocupar(True, "Leyendo el archivo base...")
+            # Mientras se lee el maestro, se consultan en GitHub las
+            # correcciones de ubicacion vigentes (hasta que lleguen no se
+            # puede publicar: la lista de sin ubicacion aun no es la real).
+            self.overrides_listos = False
+            threading.Thread(target=self._traer_overrides, daemon=True).start()
             self.en_segundo_plano(self._leer, ruta)
 
         def _leer(self, ruta):
@@ -1181,6 +1473,14 @@ def abrir_ventana():
             # los cambios de ruta ya estan aplicados en la lista.
             self._leer_control()
             self.cola.put(("leido", filas, time.time() - inicio))
+
+        def _traer_overrides(self):
+            try:
+                overrides, al_dia = overrides_vigentes()
+            except Exception:
+                registrar_error(traceback.format_exc())
+                overrides, al_dia = overrides_locales(), False
+            self.cola.put(("overrides", overrides, al_dia))
 
         def _leer_control(self):
             """Lo que el usuario escribio en el Excel de control (cambios de
@@ -1240,7 +1540,13 @@ def abrir_ventana():
 
             self.log(f"Leídas {len(filas):,} filas de la base en {segundos:.0f} s.")
             self.refrescar_camiones()
-            self.ocupar(False, "Revisa la fecha y los camiones, y dale a \"Generar y publicar en el mapa\".")
+            self.ocupar(False, self.mensaje_listo())
+
+        def mensaje_listo(self):
+            if self.sin_georef:
+                return (f"Hay {len(self.sin_georef)} clientes sin ubicación: corrígelos en la lista roja y luego "
+                        "\"Generar y publicar en el mapa\".")
+            return "Revisa la fecha y los camiones, y dale a \"Generar y publicar en el mapa\"."
 
         def actualizar_nota_fechas(self):
             if not self.vars_fechas:
@@ -1280,22 +1586,26 @@ def abrir_ventana():
             for camion in self.camiones:
                 self.lista.insert("", "end", iid=camion["id"])
             self.pintar_lista()
-            if not self.ocupado:
-                estado = "normal" if self.camiones else "disabled"
-                self.btn_publicar.config(state=estado)
-                self.btn_excel.config(state=estado)
+
+        def overrides_actuales(self):
+            """Correcciones vigentes + las pendientes del Excel de control que
+            de verdad se van a aplicar: exactamente lo que usara la publicacion."""
+            return con_pendientes(self.overrides_base, pendientes_aplicables(self.overrides_base, self.cambios_ubic)[0])
 
         def pintar_lista(self):
             conocidos = set(self.config.get("conocidos", []))
             marcados = clientes = 0
             total = 0.0
+            overrides = self.overrides_actuales()
             for camion in self.camiones:
                 cid = camion["id"]
                 dentro = self.incluidos[cid]
                 nuevo = bool(conocidos) and cid not in conocidos
                 varios = len(camion["liquidaciones"]) > 1
+                sin_geo = len(clientes_sin_georef([camion], overrides))
                 nombre = (nombre_chofer(camion["chofer"]) + ("   (nuevo)" if nuevo else "")
-                          + (f"   (+{camion['movidos']} de otra ruta)" if camion.get("movidos") else ""))
+                          + (f"   (+{camion['movidos']} de otra ruta)" if camion.get("movidos") else "")
+                          + (f"   ({sin_geo} SIN UBICACIÓN)" if sin_geo else ""))
                 if not varios:
                     cargues = "1"
                 elif self.separados.get(cid):
@@ -1303,7 +1613,7 @@ def abrir_ventana():
                 else:
                     cargues = f"{len(camion['liquidaciones'])} · Unificado"
                 etiquetas = ((() if dentro else ("fuera",)) + (("nuevo",) if nuevo else ())
-                             + (("varios",) if varios else ()))
+                             + (("varios",) if varios else ()) + (("singeo",) if sin_geo else ()))
                 self.lista.item(cid, tags=etiquetas, values=(
                     "☑" if dentro else "☐", cid, nombre,
                     ", ".join(str(liq) for liq in camion["liquidaciones"]),
@@ -1319,7 +1629,177 @@ def abrir_ventana():
                 texto_resumen += f" · {aplicados} cambios de ruta"
                 if problemas:
                     texto_resumen += f" ({problemas} con problema)"
-            self.lbl_resumen.config(text=texto_resumen)
+            seleccion = armar_seleccion(self.camiones, self.incluidos, self.separados)
+            self.sin_georef = clientes_sin_georef(seleccion, overrides)
+            if seleccion:
+                texto_resumen += (f" · {len(self.sin_georef)} SIN georreferencia" if self.sin_georef
+                                  else " · todos con georreferencia ✓")
+            self.lbl_resumen.config(text=texto_resumen,
+                                    style="Alerta.TLabel" if self.sin_georef else "Titulo.TLabel")
+            self.pintar_sin_georef()
+            if not self.ocupado:
+                self.estado_botones()
+
+        def errores_de_fila_ubicacion(self):
+            """{codigo: estado} de las filas de UBICACIONES con problema (por
+            ejemplo, un enlace corto pegado): para decir por que un cliente
+            sigue sin ubicacion aunque ya se haya escrito algo."""
+            import control_rutas
+            filas = self.editables.get("ubicaciones", [])
+            salida = {}
+            for i, estado in (self.estados_ubic or {}).items():
+                if isinstance(i, int) and i < len(filas):
+                    codigo = control_rutas.normalizar_codigo(filas[i].get("Código"))
+                    if codigo:
+                        salida.setdefault(codigo, estado)
+            _, conflicto = pendientes_aplicables(self.overrides_base, self.cambios_ubic)
+            for c in conflicto:
+                salida.setdefault(c["codigo"], "choca con un cambio hecho en el mapa (mira 'Corrección vigente' "
+                                               "y vuelve a escribir la tuya)")
+            for c in self.cambios_ubic:
+                if c["accion"] == "quitar":
+                    salida.setdefault(c["codigo"], "pide QUITAR la corrección (bórrala si ya no hace falta)")
+            return salida
+
+        def pintar_sin_georef(self):
+            elegido = self.lista_geo.selection()
+            self.lista_geo.delete(*self.lista_geo.get_children())
+            # Se mira si esta empaquetado (no winfo_ismapped: con la ventana
+            # minimizada, o recien empaquetado, eso da 0 y el panel quedaba).
+            visible = self.marco_geo.winfo_manager() == "pack"
+            if not self.sin_georef:
+                if visible:
+                    self.marco_geo.pack_forget()
+                if self.lbl_ayuda_camiones.winfo_manager() != "pack":
+                    self.lbl_ayuda_camiones.pack(anchor="w", pady=(6, 0))
+                return
+            n = len(self.sin_georef)
+            rutas = sorted({r for c in self.sin_georef for r in c["rutas"]})
+            self.marco_geo.config(text=f" ⚠ {n} cliente{'s' if n > 1 else ''} SIN ubicación (georreferencia) en "
+                                       f"{', '.join(rutas)}: corrígelos antes de publicar ")
+            aviso = ("Todos deben tener ubicación (mapa y My Maps). Elige un cliente → \"1. Buscar en Google Maps\" "
+                     "→ en el local, clic derecho → clic en los números (se copian) → \"2. Pegar ubicación "
+                     "copiada\". No inventes un punto: si no se sabe, pide la ubicación al vendedor (\"Copiar "
+                     "lista\"); si el camión no sale a ruta hoy, desmárcalo.")
+            if not self.overrides_al_dia:
+                aviso += "  (Sin conexión con GitHub: revisado con las correcciones de esta PC.)"
+            self.lbl_geo.config(text=aviso)
+            errores = self.errores_de_fila_ubicacion()
+            for c in self.sin_georef:
+                motivo = f"tu fila en el Excel: {errores[c['codigo']]}" if c["codigo"] in errores else c["motivo"]
+                self.lista_geo.insert("", "end", iid=c["codigo"],
+                                      values=(", ".join(c["rutas"]), c["codigo"], c["nombre"], c["direccion"],
+                                              ", ".join(c["vendedores"]), motivo))
+            self.lista_geo.config(height=max(1, min(n, 3)))
+            if elegido and self.lista_geo.exists(elegido[0]):
+                self.lista_geo.selection_set(elegido[0])
+            elif n == 1:
+                self.lista_geo.selection_set(self.sin_georef[0]["codigo"])
+            if not visible:
+                # La ayuda de la lista se esconde mientras tanto (para que
+                # quepan los camiones en pantallas chicas).
+                self.lbl_ayuda_camiones.pack_forget()
+                self.marco_geo.pack(fill="x", pady=(6, 0), before=self.marco_lista)
+
+        def geo_elegido(self):
+            sel = self.lista_geo.selection()
+            codigo = sel[0] if sel else (self.sin_georef[0]["codigo"] if len(self.sin_georef) == 1 else None)
+            cliente = next((c for c in self.sin_georef if c["codigo"] == codigo), None)
+            if not cliente:
+                messagebox.showinfo("Sin ubicación", "Primero elige un cliente de la lista roja.", parent=self.raiz)
+            return cliente
+
+        def buscar_en_maps(self):
+            import urllib.parse
+            import webbrowser
+            c = self.geo_elegido()
+            if not c:
+                return
+            consulta = ", ".join(x for x in (c["nombre"], c["direccion"], "Ecuador") if x)
+            webbrowser.open("https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(consulta))
+            self.lbl_estado.config(text=f"Buscando {c['codigo']} en Google Maps: en el local, clic derecho → clic "
+                                        "en los números, y aquí \"2. Pegar ubicación copiada\".")
+
+        def pegar_ubicacion(self):
+            import control_rutas
+            c = self.geo_elegido()
+            if not c:
+                return
+            if any(x["codigo"] == c["codigo"] for x in self.cambios_ubic):
+                messagebox.showwarning("Pegar ubicación", f"El cliente {c['codigo']} ya tiene una fila pendiente en "
+                                       "la hoja UBICACIONES del Excel de control (por ejemplo, QUITAR u otra "
+                                       "coordenada). Corrígela o bórrala allí, para que una no pise a la otra.",
+                                       parent=self.raiz)
+                return
+            if ruta_sin_subir():
+                messagebox.showwarning("Pegar ubicación", "Hay una ruta de una publicación anterior que no llegó "
+                                       "a GitHub (se cortó el internet), así que ahora no se puede guardar una "
+                                       "ubicación sola.\n\nPega esta coordenada en el Excel de control (\"Varios: "
+                                       "Excel de control\", columna 'Nueva coordenada' del cliente), guarda y "
+                                       "ciérralo: con eso se habilita \"Generar y publicar\", que sube la ruta y las "
+                                       "ubicaciones juntas.", parent=self.raiz)
+                return
+            try:
+                copiado = self.raiz.clipboard_get()
+            except tk.TclError:
+                copiado = ""
+            try:
+                lat, lng = control_rutas.parsear_coordenada(copiado)
+            except ValueError as e:
+                messagebox.showwarning("Pegar ubicación", f"Lo copiado no sirve como ubicación: {e}\n\nEn Google "
+                                       "Maps: clic derecho sobre el local → clic en los números de arriba (se "
+                                       "copian solos, ej. -1.671234, -78.654321) → aquí \"2. Pegar ubicación "
+                                       "copiada\".", parent=self.raiz)
+                return
+            if not messagebox.askyesno(
+                    "Guardar ubicación",
+                    f"Cliente {c['codigo']} {c['nombre']}\n({', '.join(c['rutas'])})\n\nUbicación: {lat:.6f}, "
+                    f"{lng:.6f}\n\nSe guarda ahora en el mapa (para siempre, igual que arrastrar el punto en el "
+                    "mapa). ¿Continuar?", parent=self.raiz):
+                return
+            cambio = {"fila": f"ventana:{c['codigo']}", "codigo": c["codigo"], "accion": "poner",
+                      "lat": lat, "lng": lng, "antes": control_rutas._como_par(self.overrides_base.get(c["codigo"]))}
+            self.ocupar(True, f"Guardando la ubicación de {c['codigo']}...")
+            self.en_segundo_plano(self._guardar_ubicacion, cambio, c)
+
+        def _guardar_ubicacion(self, cambio, cliente):
+            def log(mensaje):
+                self.cola.put(("log", mensaje))
+
+            estados = publicar(log, con_ruta=False, ubicaciones=[cambio])
+            self.cola.put(("overrides", overrides_locales(), True))
+            estado = estados.get(cambio["fila"], "")
+            if estado.startswith("Conflicto"):
+                raise ErrorRuta(f"No se guardó: la ubicación de {cliente['codigo']} se cambió en el mapa mientras "
+                                "tanto. Revisa la lista (ya se actualizó) y vuelve a intentar si hace falta.")
+            self.cola.put(("aviso", f"Ubicación guardada: {cliente['codigo']} {cliente['nombre']}."))
+
+        def copiar_sin_georef(self):
+            """Para mandar a los vendedores (son los que pueden conseguir el
+            pin del local): agrupado por vendedor."""
+            por_vendedor = {}
+            for c in self.sin_georef:
+                for v in c["vendedores"] or ["(sin vendedor)"]:
+                    por_vendedor.setdefault(v, []).append(c)
+            lineas = ["Clientes SIN ubicación en el mapa. Por favor envíen la ubicación (pin) del local:"]
+            for v in sorted(por_vendedor):
+                lineas += ["", f"Vendedor {v}:"]
+                lineas += [f"• {c['codigo']} {c['nombre']} — {c['direccion']} — camión {', '.join(c['rutas'])}"
+                           for c in por_vendedor[v]]
+            self.raiz.clipboard_clear()
+            self.raiz.clipboard_append("\n".join(lineas))
+            self.lbl_estado.config(text=f"Lista copiada ({len(self.sin_georef)} clientes, por vendedor): pégala "
+                                        "en WhatsApp.")
+
+        def estado_botones(self):
+            """Publicar solo si hay camiones y TODOS sus clientes tienen
+            georreferencia; "Solo generar Excel" con que haya camiones."""
+            hay = bool(self.camiones)
+            self.btn_excel.config(state="normal" if hay else "disabled")
+            self.btn_publicar.config(state="normal" if hay and not self.sin_georef and self.overrides_listos
+                                     else "disabled")
+            if hay and not self.overrides_listos:
+                self.lbl_estado.config(text="Revisando las ubicaciones corregidas en GitHub...")
 
         def click_lista(self, evento):
             if self.ocupado:
@@ -1342,6 +1822,29 @@ def abrir_ventana():
                 self.incluidos[camion["id"]] = valor
             self.pintar_lista()
 
+        def vigilar_control(self):
+            """Si se guardo el Excel de control (por ejemplo, despues de pegar
+            la coordenada de un cliente sin georreferencia), se vuelve a leer
+            solo, en segundo plano, y la lista se actualiza sin tocar nada."""
+            try:
+                import control_rutas
+                if (self.vars_fechas and not self.ocupado and not self.leyendo_control and not self.pausar_vigilancia
+                        and self.editables.get("mtime") != control_rutas.mtime_control()):
+                    self.leyendo_control = True
+
+                    def leer():
+                        # Puede tocar justo mientras Excel guarda: si falla, se
+                        # reintenta en la siguiente vuelta sin perder lo leido.
+                        try:
+                            self.cola.put(("control_vigilado", control_rutas.leer_editables()))
+                        except Exception:
+                            self.cola.put(("control_vigilado_fallo",))
+                    threading.Thread(target=leer, daemon=True).start()
+            except Exception:
+                registrar_error(traceback.format_exc())
+            finally:
+                self.raiz.after(SEGUNDOS_VIGILANCIA * 1000, self.vigilar_control)
+
         # -- generar / publicar -----------------------------------------
         def control_cambio(self) -> bool:
             """Si el Excel de control se guardo despues de leerlo (por ejemplo
@@ -1363,6 +1866,15 @@ def abrir_ventana():
             return True
 
         def generar(self, publicar_mapa):
+            # Mientras esta abierta la pregunta, la vigilancia no relee el
+            # Excel de control (se publica exactamente lo que se confirmo).
+            self.pausar_vigilancia = True
+            try:
+                self._preguntar_y_generar(publicar_mapa)
+            finally:
+                self.pausar_vigilancia = False
+
+        def _preguntar_y_generar(self, publicar_mapa):
             if self.control_cambio():
                 return
             seleccion = armar_seleccion(self.camiones, self.incluidos, self.separados)
@@ -1370,6 +1882,13 @@ def abrir_ventana():
                 messagebox.showwarning("Falta elegir", "Marca al menos un camión.", parent=self.raiz)
                 return
             fechas = self.fechas_marcadas()
+            if publicar_mapa and self.sin_georef:
+                messagebox.showwarning("Falta georreferencia", f"{len(self.sin_georef)} clientes no tienen "
+                                       "georreferencia y todos deben tenerla antes de publicar:\n\n"
+                                       f"{texto_sin_georef(self.sin_georef)}\n\nEn la lista en rojo: elige cada "
+                                       "cliente → \"1. Buscar en Google Maps\" → \"2. Pegar ubicación copiada\" "
+                                       "(o varios a la vez con \"Varios: Excel de control\").", parent=self.raiz)
+                return
             if publicar_mapa:
                 clientes = sum(len(c["filas"]) for c in seleccion)
                 pregunta = (f"Se va a publicar en el mapa la ruta de:\n{formato_fechas(fechas)}\n\n"
@@ -1446,7 +1965,21 @@ def abrir_ventana():
             viejos = [p for p in mapas_viejos(carpeta) if p not in nuevos] if publicar_mapa else []
             revisar_cerrados(nuevos + viejos)
 
-            datos, avisos = armar_json(seleccion, fechas, overrides_locales(cambios_ubic))
+            if publicar_mapa:
+                # Ultima revision con las correcciones que hay HOY en GitHub
+                # (pudo cambiar algo arrastrando un punto en el mapa).
+                log("Revisando la georreferencia con las correcciones vigentes...")
+                base, al_dia = overrides_vigentes()
+                self.cola.put(("overrides", base, al_dia))
+            else:
+                base = self.overrides_base
+            overrides = con_pendientes(base, pendientes_aplicables(base, cambios_ubic)[0])
+            datos, avisos = armar_json(seleccion, fechas, overrides)
+            if publicar_mapa and datos.get("sin_ubicacion"):
+                faltan = clientes_sin_georef(seleccion, overrides)
+                raise ErrorRuta(f"{len(faltan)} clientes no tienen georreferencia y todos deben tenerla:\n\n"
+                                f"{texto_sin_georef(faltan)}\n\nCorrígelos en la lista en rojo (\"1. Buscar en "
+                                f"Google Maps\" → \"2. Pegar ubicación copiada\") y vuelve a publicar.\n{NO_PUBLICADO}")
             if publicar_mapa and not datos["camiones"]:
                 raise ErrorRuta("Ningún camión tiene clientes con ubicación válida.\n" + NO_PUBLICADO)
 
@@ -1464,18 +1997,23 @@ def abrir_ventana():
 
             if publicar_mapa:
                 estados_ubic = publicar(log, con_ruta=True, ubicaciones=cambios_ubic)
+                # La carpeta de datos quedo igual a GitHub, con las ubicaciones aplicadas.
+                self.cola.put(("overrides", overrides_locales(), True))
+                anotar_publicado(carpeta, nuevos, fechas)
                 fin = "Listo. Los choferes ya ven la ruta actualizada en el mapa."
                 fin += self._actualizar_control(log, editables, estados_cambios, estados_ubic)
             else:
                 fin = f"Listo. Se generaron {len(seleccion)} archivos MAPA en:\n{carpeta}"
             self.cola.put(("fin", fin + ("\n\n" + aviso if aviso else ""), carpeta if publicar_mapa else None))
 
-        def _actualizar_control(self, log, editables=None, estados_cambios=None, estados_ubic=None):
+        def _actualizar_control(self, log, editables=None, estados_cambios=None, estados_ubic=None,
+                                sin_georef=()):
             """Vuelve a armar el Excel de control despues de publicar. Devuelve
             una frase para el mensaje final ('' si salio bien)."""
             import control_rutas
             try:
-                control_rutas.construir_control(log, editables, estados_cambios, estados_ubic)
+                control_rutas.construir_control(log, editables, estados_cambios, estados_ubic,
+                                                sin_georef=sin_georef)
             except ErrorRuta as e:
                 log(f"Aviso: {e}")
                 return f"\n\nEl Excel de control no se pudo actualizar: {e}"
@@ -1498,25 +2036,36 @@ def abrir_ventana():
         # -- Excel de control ---------------------------------------------
         def abrir_control(self):
             self.ocupar(True, "Armando el Excel de control...")
-            self.en_segundo_plano(self._abrir_control)
+            self.en_segundo_plano(self._abrir_control, list(self.sin_georef))
 
-        def _abrir_control(self):
+        def _abrir_control(self, sin_georef=()):
             import control_rutas
 
             def log(mensaje):
                 self.cola.put(("log", mensaje))
 
+            aviso = None
             try:
-                ruta = control_rutas.construir_control(log)
+                ruta = control_rutas.construir_control(log, sin_georef=sin_georef)
                 mensaje = "Excel de control listo."
+                if sin_georef:
+                    mensaje += f" Los {len(sin_georef)} clientes sin georreferencia están arriba en UBICACIONES."
             except ErrorRuta as e:
                 if not control_rutas.ARCHIVO_CONTROL.exists():
                     raise
                 ruta = control_rutas.ARCHIVO_CONTROL
                 mensaje = f"Se abre sin actualizar: {e}"
                 log(mensaje)
+                if sin_georef:
+                    abierto = str(e).startswith("Cierra")       # revisar_cerrados / os.replace
+                    aviso = ((f"El Excel de control está abierto, así que no se pudieron poner arriba los "
+                              f"{len(sin_georef)} clientes sin georreferencia.\n\nCiérralo y vuelve a darle a "
+                              "\"Varios: Excel de control\".") if abierto else
+                             (f"No se pudieron poner arriba los {len(sin_georef)} clientes sin georreferencia: "
+                              f"{e}")) + ("\n\nTambién puedes corregirlos uno por uno en la lista en rojo (\"1. "
+                                          "Buscar en Google Maps\" → \"2. Pegar ubicación copiada\").")
             self._leer_control()
-            self.cola.put(("abrir", ruta, mensaje))
+            self.cola.put(("abrir", ruta, mensaje, aviso))
 
         def aplicar_ubicaciones(self):
             self.ocupar(True, "Leyendo el Excel de control...")
@@ -1543,22 +2092,41 @@ def abrir_ventana():
             quitar = len(cambios) - poner
             pregunta = (f"Se van a aplicar en el mapa {poner} ubicaciones corregidas"
                         + (f" y quitar {quitar}" if quitar else "") + ".\n"
-                        "Los choferes las ven al volver a abrir el mapa (no hace falta volver a publicar la ruta).")
+                        "Los choferes las ven al volver a abrir el mapa. Un cliente que NO salía en el mapa (sin "
+                        "ubicación) aparece recién al volver a \"Generar y publicar\".")
             if errores:
                 pregunta += f"\n\nOJO: {len(errores)} filas tienen un problema y no se aplicarán."
-            if not messagebox.askyesno("Aplicar ubicaciones", pregunta + "\n\n¿Continuar?", parent=self.raiz):
-                return
+            self.pausar_vigilancia = True
+            try:
+                if not messagebox.askyesno("Aplicar ubicaciones", pregunta + "\n\n¿Continuar?", parent=self.raiz):
+                    return
+            finally:
+                self.pausar_vigilancia = False
+            # Los que no tienen ubicacion SIN contar estas pendientes (son los que
+            # hoy no salen en el mapa). Se calcula aqui, no desde el hilo.
+            seleccion = armar_seleccion(self.camiones, self.incluidos, self.separados)
+            sin_base = clientes_sin_georef(seleccion, self.overrides_base)
             self.ocupar(True, "Aplicando ubicaciones...")
-            self.en_segundo_plano(self._aplicar_ubicaciones, editables, cambios)
+            self.en_segundo_plano(self._aplicar_ubicaciones, editables, cambios, sin_base)
 
-        def _aplicar_ubicaciones(self, editables, cambios):
+        def _aplicar_ubicaciones(self, editables, cambios, sin_base=()):
             def log(mensaje):
                 self.cola.put(("log", mensaje))
 
             estados = publicar(log, con_ruta=False, ubicaciones=cambios)
+            self.cola.put(("overrides", overrides_locales(), True))
             aplicadas = sum(1 for e in estados.values() if e.startswith(("Aplicada", "Quitada")))
             fin = f"Listo. Se aplicaron {aplicadas} de {len(cambios)} cambios de ubicación."
-            fin += self._actualizar_control(log, editables, None, estados)
+            # Un cliente que no salia en el mapa (sin ubicacion) solo aparece
+            # al volver a publicar la ruta: la correccion no basta sola.
+            sin_geo = {c["codigo"] for c in sin_base}
+            if any(c["codigo"] in sin_geo and c["accion"] == "poner"
+                   and str(estados.get(c["fila"], "")).startswith("Aplicada") for c in cambios):
+                fin += ("\n\nOJO: corregiste clientes que NO salían en el mapa (sin ubicación). Para que salgan, "
+                        "vuelve a darle a \"Generar y publicar en el mapa\" (y después a My Maps).")
+            # Los que siguen sin georreferencia vuelven arriba en UBICACIONES
+            # (los que ya quedaron corregidos se descartan solos al armarlo).
+            fin += self._actualizar_control(log, editables, None, estados, sin_georef=list(sin_base))
             self.cola.put(("fin", fin))
 
         def abrir_carpeta(self):
@@ -1592,7 +2160,7 @@ def abrir_ventana():
         messagebox.showerror("Error", detalle.strip().splitlines()[-1], parent=raiz)
 
     raiz.report_callback_exception = error_de_ventana
-    Ventana(raiz)
+    raiz.ventana_app = Ventana(raiz)        # (las pruebas la buscan aqui)
     raiz.mainloop()
 
 

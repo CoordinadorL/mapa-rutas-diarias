@@ -111,8 +111,44 @@ def fecha_de_carpeta(carpeta: Path):
         return None
 
 
+ARCHIVO_PUBLICADO = "_publicado.json"     # lo escribe generar_rutas.anotar_publicado
+
+
 def archivos_mapa(carpeta: Path):
-    return sorted(p for p in carpeta.iterdir() if p.is_file() and RE_ARCHIVO.fullmatch(p.name))
+    """Los MAPA de la carpeta del dia. Si la ruta se publico, solo los que se
+    publicaron (asi My Maps sube lo mismo que el mapa web, aunque despues se
+    haya sacado algun Excel suelto con "Solo generar Excel")."""
+    todos = sorted(p for p in carpeta.iterdir() if p.is_file() and RE_ARCHIVO.fullmatch(p.name))
+    try:
+        publicados = set(json.loads((carpeta / ARCHIVO_PUBLICADO).read_text(encoding="utf-8"))["archivos"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return todos
+    return [p for p in todos if p.name in publicados]
+
+
+def cambiados_desde_publicar(carpeta: Path):
+    """MAPA publicados que ya no son iguales a lo que se publico (o que
+    faltan). Lista vacia si no hay anotacion de lo publicado."""
+    from generar_rutas import huella_archivo
+    try:
+        huellas = json.loads((carpeta / ARCHIVO_PUBLICADO).read_text(encoding="utf-8")).get("huellas") or {}
+    except (OSError, ValueError, AttributeError):
+        return []
+    cambiados = []
+    for nombre, huella in sorted(huellas.items()):
+        ruta = carpeta / nombre
+        try:
+            if huella_archivo(ruta) != huella:
+                cambiados.append(nombre)
+        except OSError:
+            cambiados.append(nombre)
+    return cambiados
+
+
+def texto_cambiados(cambiados) -> str:
+    return (f"Estos archivos cambiaron después de publicar la ruta (por ejemplo con \"Solo generar Excel\"): "
+            f"{', '.join(cambiados)}.\nPara que My Maps tenga lo mismo que el mapa web, vuelve a \"Generar y "
+            "publicar\" en \"Actualizar ruta\".")
 
 
 def datos_archivo(ruta: Path):
@@ -241,59 +277,85 @@ def limpiar_registro(registro: dict, hoy: date) -> None:
 # Copias con ubicaciones corregidas
 # ---------------------------------------------------------------------------
 
+COLUMNAS_UBICACION = ("CodigoCliente", "longitud_x", "latitud_y")
+
+
+def _encabezado(ws, ruta: Path):
+    posiciones = {str(c.value or "").strip(): i for i, c in enumerate(next(ws.iter_rows(max_row=1)))}
+    if not all(c in posiciones for c in COLUMNAS_UBICACION):
+        raise ErrorMyMaps(f"\"{ruta.name}\" no tiene las columnas CodigoCliente, longitud_x y latitud_y.")
+    return posiciones
+
+
+def camion_de_archivo(ruta: Path) -> str:
+    """'MAPA F152 CARGUE 1 - Liq 1557.xlsx' -> 'F152 CARGUE 1 - Liq 1557'."""
+    return ruta.name[len("MAPA "):-len(".xlsx")]
+
+
+def revisar_georef(archivos, overrides: dict):
+    """Clientes de los MAPA sin georreferencia valida, con la MISMA regla del
+    mapa web (generar_rutas.clientes_sin_georef). Lista vacia = todo bien."""
+    import openpyxl
+    from generar_rutas import clientes_sin_georef
+
+    camiones = []
+    for ruta in archivos:
+        wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+        try:
+            ws = wb.worksheets[0]
+            pos = _encabezado(ws, ruta)
+            filas = []
+            for valores in ws.iter_rows(min_row=2, values_only=True):
+                if not valores or all(v in (None, "") for v in valores):
+                    continue
+                filas.append({c: (valores[i] if i < len(valores) else None) for c, i in pos.items()})
+        finally:
+            wb.close()
+        chofer = next((f.get("Chofer") for f in filas if f.get("Chofer")), "")
+        camiones.append({"id": camion_de_archivo(ruta), "chofer": str(chofer or ""), "filas": filas})
+    return clientes_sin_georef(camiones, overrides)
+
+
 def preparar_copias(archivos, destino: Path, overrides: dict):
     """Copia cada MAPA (mismo nombre: es el nombre de la capa) con la
-    ubicacion corregida de cada cliente. Los clientes sin ubicacion que
-    sirva (vacia, 0,0 o fuera de Ecuador) no van en la copia: un 0,0 aleja
-    el mapa, y una sola celda vacia hace que My Maps ya no reconozca la
-    columna como latitud. Un camion sin ningun cliente ubicado no va.
-    Devuelve (copias, cuantas corregidas, cuantas sin ubicacion, camiones vacios)."""
+    ubicacion corregida de cada cliente (la misma que usa el mapa web).
+    Antes hay que revisar con revisar_georef: aqui un cliente sin ubicacion
+    valida es un error (un 0,0 aleja el mapa, y una sola celda vacia hace que
+    My Maps ya no reconozca la columna como latitud).
+    Devuelve (copias, cuantas corregidas)."""
     import openpyxl
-    from generar_rutas import a_coordenada, en_ecuador, es_numero
+    from generar_rutas import a_coordenada, codigo_texto, correccion_valida, problema_de_ubicacion
 
-    copias, corregidas, sin_ubicacion, vacios = [], 0, 0, []
+    copias, corregidas = [], 0
     for ruta in archivos:
         wb = openpyxl.load_workbook(ruta)
         try:
             ws = wb.worksheets[0]
-            encabezado = [str(c.value or "").strip() for c in ws[1]]
-            try:
-                i_cod = encabezado.index("CodigoCliente")
-                i_lng = encabezado.index("longitud_x")
-                i_lat = encabezado.index("latitud_y")
-            except ValueError:
-                raise ErrorMyMaps(f"\"{ruta.name}\" no tiene las columnas CodigoCliente, longitud_x y latitud_y.")
-            quitar, quedan = [], 0
+            pos = _encabezado(ws, ruta)
+            i_cod, i_lng, i_lat = (pos[c] for c in COLUMNAS_UBICACION)
+            vacias = []
             for fila in ws.iter_rows(min_row=2):
                 if all(c.value in (None, "") for c in fila):
-                    quitar.append(fila[0].row)
+                    vacias.append(fila[0].row)
                     continue
-                codigo = str(fila[i_cod].value or "").strip()
-                ajuste = overrides.get(codigo) if codigo else None
-                if isinstance(ajuste, dict) and es_numero(ajuste.get("lat")) and es_numero(ajuste.get("lng")) \
-                        and en_ecuador(ajuste["lat"], ajuste["lng"]):
-                    fila[i_lat].value, fila[i_lng].value = float(ajuste["lat"]), float(ajuste["lng"])
+                ajuste = correccion_valida(overrides, fila[i_cod].value)
+                if ajuste:
+                    fila[i_lat].value, fila[i_lng].value = ajuste
                     corregidas += 1
-                    quedan += 1
-                    continue
-                lat, lng = a_coordenada(fila[i_lat].value), a_coordenada(fila[i_lng].value)
-                if lat is None or lng is None or not en_ecuador(lat, lng):
-                    quitar.append(fila[0].row)
-                    sin_ubicacion += 1
+                elif problema_de_ubicacion(fila[i_lat].value, fila[i_lng].value):
+                    raise ErrorMyMaps(f"El cliente {codigo_texto(fila[i_cod].value)} de {ruta.name} no tiene "
+                                      "georreferencia válida.")
                 else:
-                    fila[i_lat].value, fila[i_lng].value = lat, lng
-                    quedan += 1
-            if not quedan:
-                vacios.append(ruta.name)
-                continue
-            for numero in reversed(quitar):
+                    fila[i_lat].value = a_coordenada(fila[i_lat].value)
+                    fila[i_lng].value = a_coordenada(fila[i_lng].value)
+            for numero in reversed(vacias):
                 ws.delete_rows(numero)
             copia = destino / ruta.name
             wb.save(copia)
         finally:
             wb.close()
         copias.append(copia)
-    return copias, corregidas, sin_ubicacion, vacios
+    return copias, corregidas
 
 
 # ---------------------------------------------------------------------------
@@ -715,9 +777,22 @@ def subir(carpeta: Path, fecha_entrega: date, log, cancelar=None, reemplazar=Fal
     archivos = archivos_mapa(carpeta)
     if not archivos:
         raise ErrorMyMaps(f"No hay archivos MAPA en:\n{carpeta}")
+    cambiados = cambiados_desde_publicar(carpeta)
+    if cambiados:
+        raise ErrorMyMaps(texto_cambiados(cambiados) + "\n(No se subió nada.)")
     if overrides is None:
-        from generar_rutas import overrides_locales
-        overrides = overrides_locales()
+        from generar_rutas import overrides_vigentes
+        log("Revisando la georreferencia de los clientes...")
+        overrides, al_dia = overrides_vigentes()
+        if not al_dia:
+            log("Aviso: sin conexión con GitHub; se usan las ubicaciones corregidas descargadas la última vez.")
+    faltan = revisar_georef(archivos, overrides)
+    if faltan:
+        from generar_rutas import texto_sin_georef
+        raise ErrorMyMaps(f"{len(faltan)} clientes no tienen georreferencia y todos deben tenerla:\n\n"
+                          f"{texto_sin_georef(faltan)}\n\nCorrígelos en \"Actualizar ruta\" (lista en rojo: \"1. "
+                          "Buscar en Google Maps\" → \"2. Pegar ubicación copiada\"), vuelve a \"Generar y publicar\" "
+                          "y luego sube a My Maps.\n(No se subió nada.)")
 
     registro = leer_registro(registro_ruta)
     entrega = fecha_entrega.isoformat()
@@ -727,16 +802,10 @@ def subir(carpeta: Path, fecha_entrega: date, log, cancelar=None, reemplazar=Fal
     temporal = Path(tempfile.mkdtemp(prefix="mymaps_"))
     creados = []
     try:
-        copias, corregidas, sin_ubicacion, vacios = preparar_copias(archivos, temporal, overrides)
+        copias, corregidas = preparar_copias(archivos, temporal, overrides)
         if corregidas:
             log(f"{corregidas} clientes van con la ubicación corregida.")
-        if sin_ubicacion:
-            log(f"{sin_ubicacion} clientes sin ubicación válida no van a My Maps (sí están en su Excel MAPA).")
-        if vacios:
-            log(f"Sin ningún cliente ubicado, no van a My Maps: {', '.join(vacios)}.")
         planes = armar_mapas(copias, fecha_entrega)
-        if not planes:
-            raise ErrorMyMaps("Ningún camión tiene clientes con ubicación válida.")
 
         with Robot(log, cancelar) as robot:
             log("Revisando la sesión de Google...")

@@ -67,7 +67,9 @@ COLS_RESUMEN = ["Fecha", "Día", "Estado", "Ruta", "Chofer", "Clientes", "Vended
 COLS_REVISAR = ["Motivo", "Ruta", "Código", "Cliente", "Dirección", "Vendedor",
                 "Coordenada que usa el mapa", "Ver en Maps", "Tiene corrección"]
 COLS_UBIC = ["Código", "Cliente", "Ruta (última vez)", "Coordenada del sistema", "Corrección vigente",
-             "Nueva coordenada", "Acción", "Estado", "Ver sistema", "Ver corrección", "Distancia (m)", "Nota"]
+             "Nueva coordenada", "Acción", "Estado", "Ver sistema", "Ver corrección", "Distancia (m)", "Nota",
+             "Dirección", "Vendedor"]
+ANCHOS_UBIC = [11, 34, 22, 24, 24, 26, 10, 60, 9, 9, 11, 30, 40, 12]
 EDITABLES_UBIC = {"Código", "Nueva coordenada", "Acción", "Nota"}
 COLS_CAMBIOS = ["Tipo", "Fecha de la ruta", "Código", "Desde ruta", "Vendedor (opcional)", "Hacia ruta",
                 "Activa", "Nota", "Estado", "Está hoy en"]
@@ -80,6 +82,15 @@ CLAVES_CAMBIOS = ["Tipo", "Fecha de la ruta", "Código", "Desde ruta", "Vendedor
 NEGRITA = Font(bold=True)
 FONDO_TITULO = PatternFill("solid", fgColor="DDDDDD")
 FONDO_EDITABLE = PatternFill("solid", fgColor="FFF2B3")
+FONDO_SIN_GEO = PatternFill("solid", fgColor="F8CBAD")
+
+# Filas que el programa pone arriba de UBICACIONES para cada cliente de la
+# ruta que se va a publicar sin georreferencia. Se reconocen por el Estado:
+# mientras no tengan 'Nueva coordenada' no son un error del usuario, y al
+# volver a armar el Excel se regeneran desde la lista de ese momento.
+MARCA_SIN_GEO = "SIN GEORREFERENCIA"
+ESTADO_SIN_GEO = (f"{MARCA_SIN_GEO}: pega en 'Nueva coordenada' su ubicación (en Google Maps: clic derecho sobre "
+                  "el local → clic en los números) y guarda")
 
 
 # ---------------------------------------------------------------------------
@@ -210,8 +221,9 @@ def datos_del_repo(log=None) -> dict:
     """Todas las rutas publicadas + las correcciones de ubicacion vigentes."""
     sin_red = False
     try:
-        if g.correr_git(["fetch", "-q", "origin"], None, tiempo=120)[0] != 0:
-            sin_red = True
+        with g.BLOQUEO_GIT:
+            if g.correr_git(["fetch", "-q", "origin"], None, tiempo=120)[0] != 0:
+                sin_red = True
     except g.ErrorRuta:
         sin_red = True
     if sin_red and log:
@@ -304,6 +316,10 @@ def leer_editables(ruta: Path = None) -> dict:
             return respaldo
         except (OSError, ValueError):
             return vacio
+    # La fecha de modificacion se toma ANTES de leer: si se vuelve a guardar
+    # mientras se lee, queda distinta y se vuelve a leer (si no, el segundo
+    # guardado quedaba como "ya leido" con el contenido del primero).
+    mtime = mtime_control(ruta)
     copia = g.copiar_sin_bloqueo(ruta)
     try:
         try:
@@ -335,8 +351,7 @@ def leer_editables(ruta: Path = None) -> dict:
             copia.unlink()
         except OSError:
             pass
-    editables = {"ubicaciones": ubic, "cambios": cambios, "foto": foto, "origen": "excel",
-                 "mtime": mtime_control(ruta)}
+    editables = {"ubicaciones": ubic, "cambios": cambios, "foto": foto, "origen": "excel", "mtime": mtime}
     guardar_respaldo(editables)
     return editables
 
@@ -355,8 +370,10 @@ def guardar_respaldo(editables: dict) -> None:
         limpio = {k: v for k, v in editables.items() if k not in ("origen", "mtime", "ilegible")}
         limpio["ubicaciones"] = [{c: _serializable(v) for c, v in f.items()} for f in limpio.get("ubicaciones", [])]
         limpio["cambios"] = [{c: _serializable(v) for c, v in f.items()} for f in limpio.get("cambios", [])]
-        RESPALDO_EDITABLES.write_text(json.dumps(limpio, ensure_ascii=False, indent=1, default=str),
-                                      encoding="utf-8")
+        # Atomico: la ventana tambien lo escribe al releer el Excel en segundo plano.
+        temporal = RESPALDO_EDITABLES.with_name(f"{RESPALDO_EDITABLES.stem}.{os.getpid()}.{id(limpio)}.tmp")
+        temporal.write_text(json.dumps(limpio, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+        os.replace(temporal, RESPALDO_EDITABLES)
     except Exception:
         pass
 
@@ -568,6 +585,25 @@ YA_ESTABA = "Ya estaba así (no hubo que cambiar nada)"
 RESUELTOS = ("Aplicada", "Quitada", "Ya estaba")
 
 
+def es_fila_sin_geo(fila: dict) -> bool:
+    return g.normalizar(fila.get("Estado")).startswith(MARCA_SIN_GEO)
+
+
+def _sin_georef_de_hoja(editables: dict):
+    """Las filas SIN GEORREFERENCIA que ya estaban en la hoja y siguen sin
+    coordenada, como lista de clientes (para conservarlas cuando no se pasa
+    la lista nueva)."""
+    salida = []
+    for f in editables.get("ubicaciones", []):
+        if es_fila_sin_geo(f) and not texto(f.get("Nueva coordenada")) and not texto(f.get("Acción")):
+            salida.append({"codigo": normalizar_codigo(f.get("Código")), "nombre": texto(f.get("Cliente")),
+                           "rutas": [r.strip() for r in texto(f.get("Ruta (última vez)")).split(",") if r.strip()],
+                           "motivo": texto(f.get("Coordenada del sistema")).strip("()") or "sin coordenadas",
+                           "direccion": texto(f.get("Dirección")),
+                           "vendedores": [v.strip() for v in texto(f.get("Vendedor")).split(",") if v.strip()]})
+    return salida
+
+
 def _cerca(a, b, metros=1.0) -> bool:
     if a is None or b is None:
         return a is None and b is None
@@ -590,16 +626,25 @@ def cambios_de_ubicacion(editables: dict):
         if not nueva and not accion:
             # Coordenada pegada por error en 'Corrección vigente' (la columna
             # de al lado): si es distinta a la correccion que habia, es nueva.
-            vigente = texto(f.get("Corrección vigente"))
-            if codigo and vigente:
+            # En una fila SIN GEORREFERENCIA tambien vale en 'Coordenada del
+            # sistema' (ahi solo estaba el motivo).
+            otras = [texto(f.get("Corrección vigente"))]
+            if es_fila_sin_geo(f):
+                otras.append(texto(f.get("Coordenada del sistema")))
+            for vigente in otras:
+                if not (codigo and vigente):
+                    continue
                 try:
                     par = list(parsear_coordenada(vigente))
                 except ValueError:
                     par = None
                 if par and not _cerca(antes, par):
                     nueva = vigente
+                    break
             if not nueva:
-                if codigo and antes is None:
+                # Una fila SIN GEORREFERENCIA todavia sin coordenada no es un
+                # error: es la lista de lo que falta (la ventana la muestra).
+                if codigo and antes is None and not es_fila_sin_geo(f):
                     estados[i] = FALTA_NUEVA
                 continue
         if not codigo:
@@ -861,8 +906,12 @@ def _leeme(datos: dict):
         "   - Corregir o agregar: escribe el Código y en 'Nueva coordenada' pega la coordenada (en Google Maps, "
         "clic derecho sobre el punto exacto → clic en los números para copiarlos, ej. -2.900123, -79.004567).",
         "   - Quitar una corrección (volver a la ubicación del sistema): en 'Acción' elige QUITAR.",
-        "   - Se aplican al publicar o con el botón 'Aplicar ubicaciones' de la ventana (no hace falta "
-        "volver a publicar la ruta). Los choferes las ven al volver a abrir el mapa.",
+        f"   - Filas en ROJO arriba ({MARCA_SIN_GEO}): clientes de la ruta que vas a publicar que no tienen "
+        "ubicación (sin coordenadas o en 0,0). TODOS deben tenerla: pega su coordenada en 'Nueva coordenada', "
+        "guarda y cierra; la ventana se actualiza sola y deja publicar cuando no falta ninguno.",
+        "   - Se aplican al publicar o con el botón 'Aplicar ubicaciones' de la ventana. Un cliente que ya "
+        "salía en el mapa se ve corregido al volver a abrir el mapa; uno que NO salía (sin ubicación) aparece "
+        "recién al volver a 'Generar y publicar' (y en My Maps, al volver a subir).",
         "• CAMBIOS DE RUTA: pasar un cliente a la ruta de otro chofer.",
         f"   - Tipo: {TIPO_DIA} (solo para la ruta de esa fecha) o {TIPO_SIEMPRE} (todas las rutas que se "
         "publiquen mientras esté Activa = SI).",
@@ -885,9 +934,12 @@ def _leeme(datos: dict):
 
 
 def construir_control(log=None, editables=None, estados_cambios=None, estados_ubic=None,
-                      ruta: Path = None) -> Path:
+                      ruta: Path = None, sin_georef=None) -> Path:
     """Arma (o vuelve a armar) el Excel de control. Conserva lo que el
-    usuario escribio en las hojas editables y pone el Estado de cada fila."""
+    usuario escribio en las hojas editables y pone el Estado de cada fila.
+    sin_georef: clientes de la ruta que se va a publicar sin georreferencia
+    (generar_rutas.clientes_sin_georef); van arriba de UBICACIONES para que
+    solo haya que pegar su coordenada."""
     ruta = ruta or ARCHIVO_CONTROL
 
     def avisar(m):
@@ -948,6 +1000,27 @@ def construir_control(log=None, editables=None, estados_cambios=None, estados_ub
         cod = normalizar_codigo(f.get("Código"))
         if cod and texto(f.get("Nota")) and cod not in notas:
             notas[cod] = f.get("Nota")
+    # Datos de clientes que aun no salen en lo publicado (un cliente nuevo sin
+    # ubicacion nunca llega a publicarse): de su fila SIN GEORREFERENCIA o de
+    # la lista de la ventana. Asi su fila conserva nombre, ruta, direccion y
+    # vendedor, y no se marca como "codigo mal escrito".
+    extra = {}
+    for c in sin_georef or []:
+        cod = normalizar_codigo(c.get("codigo"))
+        if cod:
+            extra.setdefault(cod, {"nombre": c.get("nombre", ""), "ruta": ", ".join(c.get("rutas", [])),
+                                   "motivo": f"({c.get('motivo', 'sin coordenadas')})",
+                                   "direccion": c.get("direccion", ""), "vendedor": ", ".join(c.get("vendedores", []))})
+    for f in editables.get("ubicaciones", []):
+        cod = normalizar_codigo(f.get("Código"))
+        if cod and (es_fila_sin_geo(f) or texto(f.get("Dirección")) or texto(f.get("Vendedor"))):
+            extra.setdefault(cod, {"nombre": texto(f.get("Cliente")), "ruta": texto(f.get("Ruta (última vez)")),
+                                   "motivo": texto(f.get("Coordenada del sistema")) if es_fila_sin_geo(f) else "",
+                                   "direccion": texto(f.get("Dirección")), "vendedor": texto(f.get("Vendedor"))})
+    for cod, info in extra.items():
+        if cod not in indice and info["nombre"]:
+            indice[cod] = {"nombre": info["nombre"], "ruta": info["ruta"], "lat": None, "lng": None,
+                           "motivo": info["motivo"] or "(sin coordenadas en el sistema)"}
     pendientes = []
     for i, f in enumerate(editables.get("ubicaciones", [])):
         cod = normalizar_codigo(f.get("Código"))
@@ -957,18 +1030,34 @@ def construir_control(log=None, editables=None, estados_cambios=None, estados_ub
             continue
         nueva = texto(f.get("Nueva coordenada"))
         if not nueva and cambio_de_fila.get(i, {}).get("accion") == "poner":
-            nueva = texto(f.get("Corrección vigente"))      # pegada en la columna de al lado
+            # Pegada en otra columna (la de al lado): se pasa a 'Nueva coordenada'.
+            nueva = texto_coord(cambio_de_fila[i]["lat"], cambio_de_fila[i]["lng"])
         accion = texto(f.get("Acción"))
         if not (nueva or accion or previo == FALTA_NUEVA):
-            continue
+            continue        # (incluye las SIN GEORREFERENCIA aun vacias: se regeneran abajo)
+        estado_hoja = "" if es_fila_sin_geo(f) else texto(f.get("Estado"))
         pendientes.append((cod, nueva or None, accion or None,
-                           estado or previo or texto(f.get("Estado"))
+                           estado or previo or estado_hoja
                            or "Pendiente: se aplica al publicar o con 'Aplicar ubicaciones'",
                            f.get("Nota") or notas.get(cod)))
     filas_ubic = []
     codigos_pendientes = {p[0] for p in pendientes if p[0]}
+    # Arriba de todo, los clientes sin georreferencia que no tengan ya una
+    # fila del usuario ni una correccion valida.
+    filas_sin_geo = []
+    vistos_sin_geo = set()
+    if sin_georef is None:
+        # Sin lista nueva (por ejemplo, armado desde otro lado): se conservan
+        # las que ya estaban y siguen sin coordenada.
+        sin_georef = _sin_georef_de_hoja(editables)
+    for c in sin_georef:
+        cod = normalizar_codigo(c.get("codigo"))
+        if not cod or cod in codigos_pendientes or cod in vistos_sin_geo or g.correccion_valida(overrides, cod):
+            continue
+        vistos_sin_geo.add(cod)
+        filas_sin_geo.append(_fila_sin_georef(cod, c))
     for cod, nueva, accion, estado, nota in pendientes:
-        filas_ubic.append(_fila_ubicacion(cod, indice, overrides, nueva, accion, estado, nota))
+        filas_ubic.append(_fila_ubicacion(cod, indice, overrides, nueva, accion, estado, nota, extra.get(cod)))
     aplicadas = {}
     for i, e in estados_ubic.items():
         if e.startswith("Aplicada") and i < len(editables.get("ubicaciones", [])):
@@ -979,7 +1068,7 @@ def construir_control(log=None, editables=None, estados_cambios=None, estados_ub
         if cod in codigos_pendientes:
             continue
         filas_ubic.append(_fila_ubicacion(cod, indice, overrides, None, None, aplicadas.get(cod, ""),
-                                          notas.get(cod)))
+                                          notas.get(cod), extra.get(cod)))
     # Foto con que se compara cada fila al aplicar: la correccion de hoy, salvo
     # en las filas pendientes, que guardan la que habia cuando se escribieron
     # (asi, si el mapa la cambia mientras tanto, se detecta el conflicto). Tras
@@ -1049,11 +1138,21 @@ def construir_control(log=None, editables=None, estados_cambios=None, estados_ub
 
     ws = wb.create_sheet(HOJA_UBIC)
     ws.freeze_panes = "B2"
-    _encabezado(ws, COLS_UBIC, EDITABLES_UBIC, [11, 34, 22, 24, 24, 26, 10, 60, 9, 9, 11, 30])
+    _encabezado(ws, COLS_UBIC, EDITABLES_UBIC, ANCHOS_UBIC)
     dv = DataValidation(type="list", formula1=f"{HOJA_LISTAS}!$C$1:$C$1", allow_blank=True,
                         showErrorMessage=True, errorTitle="Acción", error="Deja vacío o elige QUITAR")
     dv.add(f"G2:G{FILAS_EDITABLES}")
     ws.data_validations.append(dv)
+    for fila in filas_sin_geo:
+        celdas = []
+        for i, valor in enumerate(fila):
+            celda = WriteOnlyCell(ws, value=valor)
+            if i in (0, 1, 2, 7):
+                celda.fill = FONDO_SIN_GEO
+            elif i == 5:
+                celda.fill = FONDO_EDITABLE
+            celdas.append(celda)
+        ws.append(celdas)
     for fila in filas_ubic:
         ws.append(fila)
 
@@ -1093,23 +1192,35 @@ def construir_control(log=None, editables=None, estados_cambios=None, estados_ub
     for cod, par in sorted(foto_nueva.items()):
         ws.append([cod, par[0], par[1]])
 
+    if filas_sin_geo:
+        # Que abra directo en UBICACIONES, donde estan las filas por llenar.
+        wb.active = wb.sheetnames.index(HOJA_UBIC)
     wb.save(temporal)
     _inyectar_filas(temporal, HOJA_RUTAS, filas_rutas, len(COLS_RUTAS))
-    try:
-        os.replace(temporal, ruta)
-    except PermissionError:
+    import time as reloj
+    for intento in range(4):
         try:
-            temporal.unlink()
-        except OSError:
-            pass
-        raise g.ErrorRuta("Cierra el Excel de control (CONTROL DE RUTAS.xlsx) para que se pueda actualizar.")
+            os.replace(temporal, ruta)
+            break
+        except PermissionError:
+            # Puede ser un instante (la ventana leyendolo justo ahora); si
+            # sigue, es que esta abierto en Excel.
+            if intento < 3:
+                reloj.sleep(0.4)
+                continue
+            try:
+                temporal.unlink()
+            except OSError:
+                pass
+            raise g.ErrorRuta("Cierra el Excel de control (CONTROL DE RUTAS.xlsx) para que se pueda actualizar.")
     guardar_respaldo(editables)
     avisar(f"Excel de control actualizado: {len(fechas)} días publicados ({len(detalle)} con detalle), "
-           f"{len(overrides)} ubicaciones corregidas, {len(filas_rev)} para revisar.")
+           f"{len(overrides)} ubicaciones corregidas, {len(filas_rev)} para revisar"
+           + (f", {len(filas_sin_geo)} clientes SIN georreferencia arriba en UBICACIONES." if filas_sin_geo else "."))
     return ruta
 
 
-def _fila_ubicacion(cod, indice, overrides, nueva, accion, estado, nota):
+def _fila_ubicacion(cod, indice, overrides, nueva, accion, estado, nota, extra=None):
     info = indice.get(cod, {})
     lat_s, lng_s = info.get("lat"), info.get("lng")
     sistema = texto_coord(lat_s, lng_s) if g.es_numero(lat_s) and g.es_numero(lng_s) else \
@@ -1120,4 +1231,21 @@ def _fila_ubicacion(cod, indice, overrides, nueva, accion, estado, nota):
         g.es_numero(lng_s) else None
     return [cod, info.get("nombre", ""), info.get("ruta", ""), sistema, vigente, nueva, accion, estado,
             formula_enlace(lat_s, lng_s) if g.es_numero(lat_s) and g.es_numero(lng_s) else None,
-            formula_enlace(*ov) if ov else None, distancia, nota]
+            formula_enlace(*ov) if ov else None, distancia, nota,
+            (extra or {}).get("direccion") or None, (extra or {}).get("vendedor") or None]
+
+
+def _fila_sin_georef(cod, c):
+    """Fila de UBICACIONES para un cliente sin georreferencia (ver ESTADO_SIN_GEO).
+    En 'Ver sistema' va un enlace que busca el local en Google Maps."""
+    from urllib.parse import quote_plus
+    consulta = ", ".join(x for x in (c.get("nombre", ""), c.get("direccion", ""), "Ecuador") if x)
+    prefijo = "https://www.google.com/maps/search/?api=1&query="
+    # Excel no acepta textos de mas de 255 caracteres en una formula (sale
+    # #¡VALOR!): se acorta la busqueda hasta que la URL ya codificada quepa.
+    while consulta and len(prefijo + quote_plus(consulta, safe=",")) > 250:
+        consulta = consulta[:-5]
+    buscar = f'=HYPERLINK("{prefijo}{quote_plus(consulta, safe=",")}","Buscar")'
+    return [cod, c.get("nombre", ""), ", ".join(c.get("rutas", [])), f"({c.get('motivo', 'sin coordenadas')})",
+            "", None, None, ESTADO_SIN_GEO, buscar, None, None, None, c.get("direccion", ""),
+            ", ".join(c.get("vendedores", []))]

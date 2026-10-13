@@ -169,6 +169,50 @@ copia vieja guardada.
 4. Los choferes abren siempre el mismo link (arriba) y ven la ruta
    actualizada, sin instalar ni configurar nada (salvo pegar el código de
    acceso la primera vez).
+5. Al terminar de publicar se abre sola la ventana **My Maps** (ver abajo):
+   revisar la fecha de entrega y darle a **"Subir a My Maps"**.
+
+### Google My Maps
+
+Para los choferes que prefieren guiarse con Google Maps, la ruta del día
+también se sube a My Maps, como se hacía a mano. Ventana **My Maps** (botón
+"My Maps" de "Actualizar ruta", o doble clic en `MY MAPS.bat`):
+
+- **Ruta del día**: una de las carpetas `BASE\MAPAS\<fecha> <DÍA>`.
+- **Fecha de entrega**: va en el título. Se propone el siguiente día hábil
+  (viernes y sábado → lunes); se cambia si ese día no se trabaja.
+- Un mapa por grupo: **F1xx + F2xx**, **F3xx**, **FO** (otro prefijo, aparte).
+  Si un grupo pasa de 10 camiones se parte en mapas parejos (My Maps admite
+  10 capas por mapa); los cargues de un mismo camión van juntos.
+- Cada mapa: título `1-MAPA DE ENTREGAS LUNES 12 DE OCTUBRE`, descripción
+  `Transportistas F150-F151-...`, una capa por archivo (`MAPA F150.xlsx`)
+  agrupada por **vendedor** con un color distinto por vendedor (los 30
+  colores de My Maps, alternando para que no se confundan) y etiquetas con la
+  **Razón**; todas las capas desmarcadas; compartido "cualquiera con el
+  enlace" y **sin** búsqueda pública.
+- Las ubicaciones van **corregidas** (las mismas del mapa web). Los
+  clientes sin ubicación que sirva no se suben (una sola celda vacía hace que
+  My Maps no reconozca la columna de latitud); siguen en su Excel MAPA.
+- Abajo, los **links de los últimos 30 días** por fecha de entrega:
+  "Copiar link", "Copiar mensaje del día" (título + transportistas + link de
+  cada mapa, para WhatsApp) y "Abrir en el navegador". Al terminar de subir,
+  el mensaje ya queda copiado.
+- Los mapas con entrega de hace **más de 30 días** se mandan a la
+  **papelera de Drive** en la siguiente subida (solo los que creó el robot;
+  el mapa web guarda su historial completo). Si se vuelve a subir una
+  entrega que ya estaba, los mapas anteriores van a la papelera (sus links
+  dejan de servir).
+
+Cómo funciona: My Maps no tiene API, así que `mymaps.py` maneja un **Chrome
+aparte** (perfil propio en `data\chrome-mymaps`) con Playwright. La sesión
+de Google se inicia **a mano** en ese Chrome (el robot nunca escribe
+contraseñas; si Google pide verificar, se hace a mano y el robot espera
+hasta 10 minutos). La cuenta va en `data\mymaps_config.json` y el registro
+de mapas y links en `data\mymaps_registro.json`. Tarda ~50 s por capa: no
+usar el Chrome del robot mientras trabaja. Si algo falla, el mapa a medias
+va a la papelera, queda una captura en `data\mymaps_error.png` y se puede
+volver a intentar (o subirlo a mano con los archivos de la carpeta del día).
+Requiere `pip install playwright` (usa el Chrome instalado).
 
 ### Método anterior (sigue funcionando)
 
@@ -189,6 +233,8 @@ python convertir.py "C:\RUTAS DIARIAS\15MARTES 15"
   lee la hoja SABANA DE VENTA, arma lo mismo que la tabla dinámica de "dia"
   (agrupa por Fecha Liq, Chofer, N° Liq, vendedor, cliente... y suma Peso,
   VentaNeta y Total), genera los MAPA y publica.
+- `MY MAPS.bat` + `ventana_mymaps.py` — ventana de My Maps (subir y links);
+  `mymaps.py` — el robot que crea los mapas en My Maps.
 - `convertir.py` — convierte los `MAPA F1xx.xlsx` del día a `data/latest.json`.
 - `data/` — solo en esta computadora (está en `.gitignore`, nunca se sube a
   este repo público): `latest.json` (datos del día), `generador_config.json`

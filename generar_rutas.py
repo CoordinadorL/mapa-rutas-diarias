@@ -1029,6 +1029,7 @@ def abrir_ventana():
             self.btn_control.pack(side="left", padx=(8, 0))
             self.btn_ubicaciones = ttk.Button(m4, text="Aplicar ubicaciones", command=self.aplicar_ubicaciones)
             self.btn_ubicaciones.pack(side="left", padx=(8, 0))
+            ttk.Button(m4, text="My Maps", command=self.abrir_mymaps).pack(side="left", padx=(8, 0))
 
             m5 = ttk.Frame(cont)
             m5.pack(fill="x", pady=(10, 0))
@@ -1124,6 +1125,9 @@ def abrir_ventana():
                 self.log(datos[0])
                 self.actualizar_nota_fechas()
                 messagebox.showinfo("Listo", datos[0], parent=self.raiz)
+                if len(datos) > 1 and datos[1]:
+                    # Recien publicada la ruta: lo siguiente es subirla a My Maps.
+                    self.abrir_mymaps(datos[1])
             elif tipo == "error":
                 self.ocupar(False, "Hubo un problema, revisa el mensaje.")
                 self.log("ERROR: " + datos[0])
@@ -1464,7 +1468,7 @@ def abrir_ventana():
                 fin += self._actualizar_control(log, editables, estados_cambios, estados_ubic)
             else:
                 fin = f"Listo. Se generaron {len(seleccion)} archivos MAPA en:\n{carpeta}"
-            self.cola.put(("fin", fin + ("\n\n" + aviso if aviso else "")))
+            self.cola.put(("fin", fin + ("\n\n" + aviso if aviso else ""), carpeta if publicar_mapa else None))
 
         def _actualizar_control(self, log, editables=None, estados_cambios=None, estados_ubic=None):
             """Vuelve a armar el Excel de control despues de publicar. Devuelve
@@ -1565,6 +1569,16 @@ def abrir_ventana():
                 os.startfile(CARPETA_MAPAS_FIJA)
             elif self.archivo_base:
                 os.startfile(self.archivo_base.parent)
+
+        def abrir_mymaps(self, carpeta=None):
+            try:
+                import ventana_mymaps
+            except Exception:
+                registrar_error(traceback.format_exc())
+                messagebox.showerror("My Maps", "No se pudo abrir la ventana de My Maps (detalle en "
+                                     "data/generador_error.log).", parent=self.raiz)
+                return
+            ventana_mymaps.abrir(self.raiz, carpeta or self.carpeta_ultima)
 
         def abrir_base_en_excel(self):
             if self.archivo_base and self.archivo_base.is_file():

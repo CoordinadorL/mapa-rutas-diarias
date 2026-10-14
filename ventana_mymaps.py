@@ -26,6 +26,30 @@ SEGUNDOS_POR_MAPA = 40
 _abierta = None
 
 
+# Textos de cancelar segun el trabajo en curso.
+TEXTOS_TRABAJO = {
+    "subir": {
+        "haciendo": "Se está subiendo a My Maps",
+        "pregunta": "¿Cancelar la subida a My Maps?\nEl mapa que se está armando va a la papelera.",
+        "cancelado": "Se canceló la subida a My Maps.\nLo que quedó a medias se mandó a la papelera.",
+    },
+    "actualizar": {
+        "haciendo": "Se están actualizando ubicaciones en My Maps",
+        "pregunta": "¿Cancelar la actualización?\nLos mapas y sus links siguen; el que se está "
+                    "actualizando puede quedar a medias.",
+        "cancelado": "Se canceló la actualización. Los mapas y sus links siguen, pero el que se estaba "
+                     "actualizando puede haber quedado a medias: vuelve a darle a «Actualizar My Maps» para "
+                     "completarlo.",
+    },
+    "limpiar": {
+        "haciendo": "Se están limpiando los mapas viejos",
+        "pregunta": "¿Cancelar la limpieza de mapas viejos?\nLo que ya fue a la papelera se queda allí.",
+        "cancelado": "Se canceló la limpieza. Lo que ya fue a la papelera se queda allí; "
+                     "lo demás se limpia la próxima vez.",
+    },
+}
+
+
 def registrar_error(detalle: str) -> None:
     try:
         ARCHIVO_ERRORES.parent.mkdir(exist_ok=True)
@@ -60,11 +84,35 @@ def carpetas_del_dia():
     return sorted(salida, key=lambda p: p.name, reverse=True)[:CARPETAS_A_MOSTRAR]
 
 
-def abrir(padre=None, carpeta: Path = None):
-    """Abre la ventana (o la trae al frente si ya esta abierta)."""
+def revisar_actualizaciones():
+    """Mapas ya subidos (de hoy en adelante) con ubicaciones corregidas
+    despues de subirlos. Devuelve (resumen [(titulo, [capas])], avisos)."""
+    import tempfile
+    import shutil
+    import generar_rutas
+    registro = mymaps.leer_registro()
+    if not mymaps.actualizables(registro, date.today()):
+        return [], []                   # nada subido de hoy en adelante: ni se consulta GitHub
+    overrides, al_dia = generar_rutas.overrides_vigentes()
+    if not al_dia:
+        # Con lo descargado la ultima vez se podria proponer volver a una
+        # ubicacion vieja: no se propone nada.
+        return [], ["Sin conexión con GitHub: no se puede revisar si hay ubicaciones corregidas para My Maps."]
+    temporal = Path(tempfile.mkdtemp(prefix="mymaps_rev_"))
+    try:
+        planes, avisos = mymaps.mapas_por_actualizar(registro, overrides, date.today(), temporal)
+        return [(p["mapa"]["titulo"], sorted(p["capas"])) for p in planes], avisos
+    finally:
+        shutil.rmtree(temporal, ignore_errors=True)
+
+
+def abrir(padre=None, carpeta: Path = None, ofrecer_actualizar=False):
+    """Abre la ventana (o la trae al frente si ya esta abierta).
+    ofrecer_actualizar: si hay mapas ya subidos con ubicaciones corregidas,
+    preguntar enseguida si se actualizan (se usa despues de corregir)."""
     global _abierta
     if _abierta is not None and _abierta.viva():
-        _abierta.traer(carpeta)
+        _abierta.traer(carpeta, ofrecer_actualizar)
         return _abierta
     import tkinter as tk
 
@@ -74,15 +122,15 @@ def abrir(padre=None, carpeta: Path = None):
         except Exception:
             pass
         raiz = tk.Tk()
-        _abierta = VentanaMyMaps(raiz, carpeta)
+        _abierta = VentanaMyMaps(raiz, carpeta, ofrecer_actualizar)
         raiz.mainloop()
     else:
-        _abierta = VentanaMyMaps(tk.Toplevel(padre), carpeta)
+        _abierta = VentanaMyMaps(tk.Toplevel(padre), carpeta, ofrecer_actualizar)
     return _abierta
 
 
 class VentanaMyMaps:
-    def __init__(self, ventana, carpeta=None):
+    def __init__(self, ventana, carpeta=None, ofrecer_actualizar=False):
         import tkinter as tk
         from tkinter import messagebox, ttk
 
@@ -91,7 +139,13 @@ class VentanaMyMaps:
         self.cola = queue.Queue()
         self.cancelar = threading.Event()
         self.trabajando = False
-        self.cerrar_al_terminar = False
+        self.cerrar_al_terminar = None      # ventana a cerrar cuando termine el trabajo en curso
+        self.cerrar_pendiente = None        # X de "Actualizar ruta" con una pregunta abierta aqui
+        self.preguntando = 0                # preguntas (askyesno) abiertas
+        self.ofrecer_programado = False
+        # "Actualizar ruta" lo cambia por una funcion que dice si alla hay una
+        # pregunta abierta o se esta publicando (no se ofrece encima).
+        self.otra_ocupada = lambda: False
         self.carpetas = []
         self.fechas_entrega = []
         self.planes = []
@@ -99,12 +153,17 @@ class VentanaMyMaps:
         # hasta que diga "ok" no se puede subir.
         self.georef = {"carpeta": None, "estado": "revisando", "faltan": [], "al_dia": True}
         self.revision_n = 0
+        # Mapas ya subidos con ubicaciones corregidas (para actualizarlos).
+        self.por_actualizar = []
+        self.ofrecer_actualizar = ofrecer_actualizar
+        self.trabajo = None             # "subir", "actualizar" o "limpiar" (para los textos de cancelar)
         self.escala = max(1.0, ventana.winfo_fpixels("1i") / 96)
         self.construir()
         self.cargar_carpetas(carpeta)
         self.pintar_links()
         ventana.protocol("WM_DELETE_WINDOW", self.al_cerrar)
         ventana.after(100, self.revisar_cola)
+        self.buscar_actualizaciones()
 
     def px(self, n):
         return int(n * self.escala)
@@ -115,12 +174,17 @@ class VentanaMyMaps:
         except Exception:
             return False
 
-    def traer(self, carpeta=None):
+    def traer(self, carpeta=None, ofrecer_actualizar=False):
         self.v.deiconify()
         self.v.lift()
         self.v.focus_force()
-        if carpeta and not self.trabajando:
-            self.cargar_carpetas(carpeta)
+        # Aunque este trabajando se recuerda que hay que ofrecer actualizar: se
+        # busca al terminar el trabajo en curso.
+        self.ofrecer_actualizar = self.ofrecer_actualizar or ofrecer_actualizar
+        if not self.trabajando:
+            if carpeta:
+                self.cargar_carpetas(carpeta)
+            self.buscar_actualizaciones()
 
     # -- armado --------------------------------------------------------------
     def construir(self):
@@ -188,8 +252,19 @@ class VentanaMyMaps:
 
         m2 = ttk.LabelFrame(cont, text=f" 2. Links de My Maps (últimos {mymaps.DIAS_HISTORIAL} días) ", padding=8)
         m2.pack(fill="both", expand=True, pady=(10, 0))
+        # Mapas ya subidos con cambios despues (ubicaciones corregidas o ruta
+        # vuelta a publicar): se actualizan sin cambiar el link. Solo aparece
+        # cuando hay alguno.
+        self.marco_act = tk.Frame(m2, background="#fff4e0", padx=8, pady=6)
+        self.lbl_act = tk.Label(self.marco_act, text="", background="#fff4e0", foreground="#8a4b00", anchor="w",
+                                justify="left", wraplength=self.px(600), font=("Segoe UI", 9, "bold"))
+        self.lbl_act.pack(side="left", fill="x", expand=True)
+        self.btn_actualizar = ttk.Button(self.marco_act, text="Actualizar My Maps (mismo link)",
+                                         command=self.actualizar)
+        self.btn_actualizar.pack(side="right", padx=(8, 0))
         marco2 = ttk.Frame(m2)
         marco2.pack(fill="both", expand=True)
+        self.marco_links = marco2
         self.lista_links = ttk.Treeview(marco2, columns=("transportistas", "link"), show="tree headings",
                                         selectmode="browse")
         self.lista_links.heading("#0", text="Entrega / mapa", anchor="w")
@@ -210,8 +285,12 @@ class VentanaMyMaps:
         ttk.Button(botones, text="Copiar link", command=self.copiar_link).pack(side="left")
         ttk.Button(botones, text="Copiar mensaje del día", command=self.copiar_dia).pack(side="left", padx=(6, 0))
         ttk.Button(botones, text="Abrir en el navegador", command=self.abrir_link).pack(side="left", padx=(6, 0))
+        self.btn_limpiar = ttk.Button(botones, text="Limpiar mapas viejos", command=self.limpiar)
+        self.btn_limpiar.pack(side="right")
         ttk.Label(m2, text="\"Copiar mensaje del día\" copia título, transportistas y link de todos los mapas de esa "
-                           "entrega, listo para pegar en WhatsApp.",
+                           f"entrega, listo para pegar en WhatsApp. \"Limpiar mapas viejos\" manda a la papelera los "
+                           f"de entrega de hace más de {mymaps.DIAS_HISTORIAL} días (también los hechos a mano); "
+                           "se hace solo en cada subida.",
                   style="Ayuda.TLabel", wraplength=self.px(780)).pack(anchor="w", pady=(4, 0))
 
         m3 = ttk.Frame(cont)
@@ -236,7 +315,8 @@ class VentanaMyMaps:
         listo = (not self.trabajando and bool(self.planes) and self.georef["estado"] == "ok"
                  and self.georef["carpeta"] == self.carpeta_actual())
         self.btn_subir.config(state="normal" if listo else "disabled")
-        self.btn_revisar.config(state="disabled" if self.trabajando else "normal")
+        for boton in (self.btn_revisar, self.btn_limpiar, self.btn_actualizar):
+            boton.config(state="disabled" if self.trabajando else "normal")
 
     def ocupar(self, ocupado, mensaje=""):
         self.trabajando = ocupado
@@ -289,10 +369,62 @@ class VentanaMyMaps:
                 self.pintar_georef()
                 self.estado_subir()
             return
+        if tipo == "actualizables":
+            # Resultado de buscar mapas con cambios para My Maps (en segundo plano).
+            resumen, avisos = datos
+            if self.trabajando:
+                return              # se vuelve a buscar al terminar el trabajo en curso
+            self.por_actualizar = resumen or []
+            self.pintar_actualizables(avisos or [])
+            if not self.por_actualizar:
+                self.ofrecer_actualizar = False     # nada que ofrecer
+            if not self.ofrecer_programado:
+                self.ofrecer_si_se_puede()
+            return
         self.ocupar(False)
+        self.trabajo = None
         self.pintar_links()
-        if self.cerrar_al_terminar:
-            self.v.destroy()
+        cerrar, self.cerrar_al_terminar = self.cerrar_al_terminar, None
+        if cerrar is not None and tipo == "error":
+            # Se pidio cancelar y cerrar. Queda anotado por si al final no se
+            # cierra (p. ej. "Actualizar ruta" estaba publicando y se dijo No).
+            self.log("ERROR: " + datos[0])
+            self.lbl_estado.config(text="Cancelado.")
+            cerrar.destroy()
+            return
+        if cerrar is None:
+            # Al terminar cualquier trabajo se vuelve a mirar si hay mapas
+            # con cambios (pudieron aplicarse mientras tanto).
+            self.buscar_actualizaciones()
+        # Si se pidio cerrar pero el trabajo alcanzo a terminar bien, primero
+        # se avisa lo que quedo hecho (y se copian los links) y luego se cierra.
+        previo = "No alcanzó a cancelarse: ya había terminado.\n\n" if cerrar is not None else ""
+        self.terminar(tipo, datos, previo)
+        if cerrar is not None:
+            cerrar.destroy()
+
+    def terminar(self, tipo, datos, previo=""):
+        if tipo == "fin_actualizar":
+            hechos = datos[0]
+            if not hechos:
+                self.lbl_estado.config(text="No había nada para actualizar.")
+                self.messagebox.showinfo("My Maps", previo + "No había cambios para pasar a My Maps.", parent=self.v)
+                return
+            self.lbl_estado.config(text=f"Listo: {len(hechos)} mapas actualizados (mismos links).")
+            self.messagebox.showinfo("My Maps", previo + "Listo. Se actualizaron en My Maps:\n\n"
+                                     + "\n".join(f"• {t}: {', '.join(c)}" for t, c in hechos)
+                                     + "\n\nLos links son los mismos: los choferes solo vuelven a abrir el mapa.",
+                                     parent=self.v)
+            return
+        if tipo == "fin_limpiar":
+            enviados = datos[0]
+            self.lbl_estado.config(text=f"Limpieza lista: {len(enviados)} mapas a la papelera.")
+            self.messagebox.showinfo("My Maps", previo + ((f"Se mandaron a la papelera {len(enviados)} mapas:\n\n"
+                                                           + "\n".join(f"• {m.get('titulo')}" for m in enviados[:20])
+                                                           + ("\n..." if len(enviados) > 20 else ""))
+                                                          if enviados else f"No hay mapas con entrega de hace más "
+                                                                           f"de {mymaps.DIAS_HISTORIAL} días."),
+                                     parent=self.v)
             return
         if tipo == "fin":
             creados, fecha = datos
@@ -301,7 +433,7 @@ class VentanaMyMaps:
             self.copiar(texto)
             self.seleccionar_dia(fecha)
             self.lbl_estado.config(text=f"Listo: {len(creados)} mapas en My Maps.")
-            self.messagebox.showinfo("My Maps", f"Listo. Se crearon {len(creados)} mapas en My Maps para el "
+            self.messagebox.showinfo("My Maps", previo + f"Listo. Se crearon {len(creados)} mapas en My Maps para el "
                                      f"{mymaps.fecha_larga(fecha)}.\n\nEl mensaje con los links ya está copiado: "
                                      "pégalo en WhatsApp.", parent=self.v)
         elif tipo == "error":
@@ -310,6 +442,32 @@ class VentanaMyMaps:
             self.log("ERROR: " + datos[0])
             self.revisar_georef()       # por si el problema fue de ubicaciones: que se vea abajo
             self.messagebox.showerror("My Maps", datos[0], parent=self.v)
+
+    def preguntar(self, titulo, texto):
+        """askyesno sin que la oferta automatica de actualizar salga encima
+        (Tk sigue atendiendo la cola mientras la pregunta esta abierta). Si
+        llego una oferta mientras tanto, se vuelve a buscar al cerrarla."""
+        self.preguntando += 1
+        try:
+            return self.messagebox.askyesno(titulo, texto, parent=self.v)
+        finally:
+            self.preguntando -= 1
+            if not self.preguntando and self.ofrecer_actualizar and self.viva():
+                self.v.after_idle(self.ofrecer_si_se_puede)
+
+    def ofrecer_si_se_puede(self):
+        """Ofrece actualizar (si se pidio y hay algo) cuando no hay otra
+        pregunta ni trabajo, aqui ni en "Actualizar ruta"; si no, lo vuelve
+        a intentar en un segundo."""
+        self.ofrecer_programado = False
+        if not self.viva() or not self.ofrecer_actualizar or self.trabajando or not self.por_actualizar:
+            return
+        if self.preguntando or self.otra_ocupada():
+            self.ofrecer_programado = True
+            self.v.after(1000, self.ofrecer_si_se_puede)
+            return
+        self.ofrecer_actualizar = False
+        self.actualizar()
 
     def copiar(self, texto):
         self.v.clipboard_clear()
@@ -440,12 +598,13 @@ class VentanaMyMaps:
                     if m.get("estado") == "activo"]
         if vencidos:
             pregunta += f"\n\nTambién van a la papelera {len(vencidos)} mapas de hace más de {mymaps.DIAS_HISTORIAL} días."
-        if not self.messagebox.askyesno("Subir a My Maps", pregunta + "\n\n¿Continuar?", parent=self.v):
+        if not self.preguntar("Subir a My Maps", pregunta + "\n\n¿Continuar?") or self.trabajando:
             return
         self.cancelar.clear()
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.config(state="disabled")
+        self.trabajo = "subir"
         self.ocupar(True, "Subiendo a My Maps...")
         threading.Thread(target=self._subir, args=(carpeta, entrega, bool(ya)), daemon=True).start()
 
@@ -456,8 +615,8 @@ class VentanaMyMaps:
         try:
             creados = mymaps.subir(carpeta, entrega, log, self.cancelar, reemplazar=reemplazar)
             self.cola.put(("fin", creados, entrega))
-        except mymaps.Cancelado as e:
-            self.cola.put(("error", f"{e}\nLo que quedó a medias se mandó a la papelera."))
+        except mymaps.Cancelado:
+            self.cola.put(("error", TEXTOS_TRABAJO["subir"]["cancelado"]))
         except mymaps.ErrorMyMaps as e:
             self.cola.put(("error", str(e)))
         except Exception as e:
@@ -474,21 +633,146 @@ class VentanaMyMaps:
             else:
                 self.cola.put(("error", "Algo falló inesperadamente:\n\n" + detalle.strip().splitlines()[-1]))
 
-    def pedir_cancelar(self):
-        if self.trabajando and self.messagebox.askyesno(
-                "Cancelar", "¿Cancelar la subida a My Maps?\nEl mapa que se está armando va a la papelera.",
-                parent=self.v):
-            self.cancelar.set()
-            self.lbl_estado.config(text="Cancelando (termina el paso que está haciendo)...")
+    # -- actualizar ubicaciones / limpiar --------------------------------------------
+    def buscar_actualizaciones(self):
+        """En segundo plano: mapas ya subidos con cambios despues (ubicaciones
+        corregidas o ruta vuelta a publicar)."""
+        def buscar():
+            try:
+                resumen, avisos = revisar_actualizaciones()
+            except Exception:
+                registrar_error(traceback.format_exc())
+                resumen, avisos = [], []
+            self.cola.put(("actualizables", resumen, avisos))
+        threading.Thread(target=buscar, daemon=True).start()
 
-    def al_cerrar(self):
-        if not self.trabajando:
-            self.v.destroy()
+    def pintar_actualizables(self, avisos=()):
+        if not self.por_actualizar and not avisos:
+            self.marco_act.pack_forget()
             return
-        if self.messagebox.askyesno("My Maps", "Se está subiendo a My Maps. ¿Cancelar y cerrar?", parent=self.v):
-            self.cancelar.set()
-            self.cerrar_al_terminar = True
-            self.lbl_estado.config(text="Cancelando; la ventana se cierra sola al terminar...")
+        if self.por_actualizar:
+            capas = sum(len(c) for _, c in self.por_actualizar)
+            texto = (f"⟳ Cambios que aún no están en My Maps (ubicaciones corregidas o ruta vuelta a publicar): "
+                     f"{len(self.por_actualizar)} mapas, "
+                     f"{capas} capas (" + "; ".join(f"{t.split('-MAPA')[0]}: {', '.join(c)}"
+                                                    for t, c in self.por_actualizar) + ").")
+        else:
+            texto = ""
+        if avisos:
+            texto = (texto + "\n" if texto else "") + "\n".join(avisos)
+        self.lbl_act.config(text=texto)
+        self.btn_actualizar.pack(side="right", padx=(8, 0)) if self.por_actualizar else self.btn_actualizar.pack_forget()
+        if self.marco_act.winfo_manager() != "pack":
+            self.marco_act.pack(fill="x", pady=(0, 6), before=self.marco_links)
+
+    def actualizar(self):
+        if self.trabajando or not self.por_actualizar:
+            return
+        capas = sum(len(c) for _, c in self.por_actualizar)
+        pregunta = ("Se van a pasar a My Maps los cambios (ubicaciones corregidas o ruta vuelta a publicar). "
+                    "Los links NO cambian:\n\n"
+                    + "\n".join(f"• {t}: {', '.join(c)}" for t, c in self.por_actualizar)
+                    + f"\n\nTarda unos {max(1, round(capas * 1.5))} minutos. Se abre el Chrome del robot: no lo "
+                      "uses mientras trabaja.")
+        if not self.preguntar("Actualizar My Maps", pregunta + "\n\n¿Continuar?") or self.trabajando:
+            return
+        self.cancelar.clear()
+        self.trabajo = "actualizar"
+        self.ocupar(True, "Actualizando My Maps...")
+        threading.Thread(target=self._trabajo_robot, args=(self._actualizar,), daemon=True).start()
+
+    def _actualizar(self, log):
+        self.cola.put(("fin_actualizar", mymaps.actualizar_ubicaciones(log, self.cancelar)))
+
+    def limpiar(self):
+        if self.trabajando:
+            return
+        if not self.preguntar(
+                "Limpiar mapas viejos",
+                "Se revisan tus mapas de My Maps (también los que hiciste a mano, por su fecha de entrega) y se "
+                f"mandan a la papelera de Drive los de entrega de hace más de {mymaps.DIAS_HISTORIAL} días.\n"
+                "Se abre el Chrome del robot unos minutos.\n\n¿Continuar?") or self.trabajando:
+            return
+        self.cancelar.clear()
+        self.trabajo = "limpiar"
+        self.ocupar(True, "Limpiando mapas viejos...")
+        threading.Thread(target=self._trabajo_robot, args=(self._limpiar,), daemon=True).start()
+
+    def _limpiar(self, log):
+        self.cola.put(("fin_limpiar", mymaps.limpiar(log, self.cancelar)))
+
+    def _trabajo_robot(self, funcion):
+        """Corre un trabajo del robot en segundo plano con los mismos mensajes
+        de error que la subida."""
+        def log(mensaje):
+            self.cola.put(("log", mensaje))
+        try:
+            funcion(log)
+        except mymaps.Cancelado:
+            self.cola.put(("error", TEXTOS_TRABAJO.get(self.trabajo, TEXTOS_TRABAJO["subir"])["cancelado"]))
+        except mymaps.ErrorMyMaps as e:
+            self.cola.put(("error", str(e)))
+        except Exception as e:
+            registrar_error(traceback.format_exc())
+            if type(e).__name__ == "ErrorRuta":
+                self.cola.put(("error", str(e)))
+            elif type(e).__module__.startswith("playwright"):
+                self.cola.put(("error", "My Maps no respondió como se esperaba (puede que Google haya cambiado "
+                                        "algo en la página o que se haya cerrado el Chrome del robot).\n\nVuelve a "
+                                        f"intentar.\n\nDetalle: {str(e).splitlines()[0][:200]}"))
+            else:
+                self.cola.put(("error", "Algo falló inesperadamente:\n\n"
+                                        + traceback.format_exc().strip().splitlines()[-1]))
+
+    def pedir_cancelar(self):
+        textos = TEXTOS_TRABAJO.get(self.trabajo, TEXTOS_TRABAJO["subir"])
+        if not self.trabajando:
+            return
+        si = self.preguntar("Cancelar", textos["pregunta"])
+        pendiente, self.cerrar_pendiente = self.cerrar_pendiente, None
+        if not si:
+            return
+        if not self.trabajando:         # termino mientras se preguntaba
+            if pendiente is not None:
+                pendiente.destroy()
+            return
+        self.cancelar.set()
+        if pendiente is not None:
+            # Mientras se preguntaba se cerro "Actualizar ruta": se cierra al terminar.
+            self.cerrar_al_terminar = pendiente
+        self.lbl_estado.config(text="Cancelando (termina el paso que está haciendo)...")
+
+    def al_cerrar(self, cerrar=None):
+        """cerrar: la ventana que se cierra al final (esta, o la de
+        "Actualizar ruta" si se cerro aquella mientras el robot trabajaba)."""
+        cerrar = cerrar or self.v
+        if not self.trabajando:
+            cerrar.destroy()
+            return
+        if self.cerrar_al_terminar is not None:
+            # Ya se pidio cancelar y cerrar: no se vuelve a preguntar. Si ahora
+            # se pide cerrar tambien "Actualizar ruta", se cierra todo.
+            if cerrar is not self.v:
+                self.cerrar_al_terminar = cerrar
+            return
+        if self.preguntando:
+            # Ya hay una pregunta abierta aqui: no se apila otra. Si es la X de
+            # "Actualizar ruta", se recuerda y vale si se contesta que si.
+            if cerrar is not self.v:
+                self.cerrar_pendiente = cerrar
+            return
+        textos = TEXTOS_TRABAJO.get(self.trabajo, TEXTOS_TRABAJO["subir"])
+        si = self.preguntar("My Maps", f"{textos['haciendo']}. ¿Cancelar y cerrar?")
+        pendiente, self.cerrar_pendiente = self.cerrar_pendiente, None
+        if not si:
+            return
+        cerrar = pendiente or cerrar
+        if not self.trabajando:         # termino mientras se preguntaba
+            cerrar.destroy()
+            return
+        self.cancelar.set()
+        self.cerrar_al_terminar = cerrar
+        self.lbl_estado.config(text="Cancelando; se cierra solo al terminar el paso en curso...")
 
     # -- links ------------------------------------------------------------------------
     def pintar_links(self):
@@ -507,7 +791,9 @@ class VentanaMyMaps:
                 if self.lista_links.exists(f"mapa:{m['mid']}"):
                     continue
                 self.lista_links.insert(padre, "end", iid=f"mapa:{m['mid']}", text=m["titulo"],
-                                        values=("-".join(m.get("transportistas", [])), m["url"]))
+                                        values=("-".join(m.get("transportistas", []))
+                                                or ("(hecho a mano)" if m.get("origen") == "manual" else ""),
+                                                m["url"]))
         if not por_dia:
             self.lista_links.insert("", "end", text="Todavía no hay mapas subidos con el robot.")
 

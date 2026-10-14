@@ -172,7 +172,13 @@ copia vieja guardada.
      "Varios: Excel de control" los pone arriba en UBICACIONES (filas en
      rojo); se pega la coordenada, se guarda y la lista se actualiza sola.
      "Copiar lista para vendedores" la deja lista para WhatsApp, agrupada por
-     vendedor. Las correcciones se revisan contra lo vigente en GitHub
+     vendedor. También se puede pegar el enlace corto que comparte el
+     celular (`maps.app.goo.gl/…`): el programa lo abre (sin descargar la
+     página) para sacar el punto; lo mismo en la hoja UBICACIONES (se abre
+     al leer el Excel, en segundo plano; si no hay internet o Google no
+     responde, la fila queda con el aviso y se vuelve a intentar al guardar el
+     Excel otra vez; si el enlace no existe, la fila lo dice).
+     Las correcciones se revisan contra lo vigente en GitHub
      (incluidas las hechas arrastrando en el mapa); sin internet se usa lo
      último descargado y se avisa.
 3. **"Generar y publicar en el mapa"**: crea los `MAPA Fxxx.xlsx`
@@ -216,10 +222,40 @@ también se sube a My Maps, como se hacía a mano. Ventana **My Maps** (botón
   cada mapa, para WhatsApp) y "Abrir en el navegador". Al terminar de subir,
   el mensaje ya queda copiado.
 - Los mapas con entrega de hace **más de 30 días** se mandan a la
-  **papelera de Drive** en la siguiente subida (solo los que creó el robot;
-  el mapa web guarda su historial completo). Si se vuelve a subir una
-  entrega que ya estaba, los mapas anteriores van a la papelera (sus links
-  dejan de servir).
+  **papelera de Drive** en cada subida, o con **"Limpiar mapas viejos"**.
+  Entran también los **hechos a mano** antes del robot: se reconocen por el
+  título `N-MAPA DE ENTREGAS <DÍA> <DD> DE <MES>` (la fecha sale del número
+  y el mes; el año, de la fecha que muestra la lista de My Maps) y salen en
+  la lista de links como "(hecho a mano)". El mapa web guarda su historial
+  completo. Si se vuelve a subir una entrega que ya estaba, los mapas
+  anteriores van a la papelera (sus links dejan de servir).
+- **Actualizar My Maps sin cambiar el link:** al subir se guarda una huella
+  de todo lo que lleva cada capa. Si después se corrige un cliente (Excel de
+  control, la ventana o el mapa web) o se vuelve a "Generar y publicar" con
+  otros datos en los mismos camiones (vendedor, razón, un cliente que pasa
+  de un camión a otro), la ventana My Maps lo detecta para los mapas de hoy
+  en adelante y ofrece "Actualizar My Maps (mismo link)": el robot usa
+  "Volver a importar → Sustituir todos los elementos" solo en esas capas,
+  las devuelve a su orden y las deja desmarcadas. Tras "Aplicar ubicaciones"
+  la ventana se abre sola y pregunta (nunca encima de otra pregunta).
+  Si después de subir cambiaron los camiones o cargues (o aparece un camión
+  de un grupo que no tiene mapa), avisa que hay que volver a subir la ruta;
+  si los MAPA cambiaron sin publicar, que primero hay que publicar. Sin
+  conexión con GitHub no propone nada (podría volver a una ubicación vieja).
+  Si un mapa falla se sigue con los demás y al final dice cuál; un mapa
+  borrado a mano se deja de ofrecer. Cancelar deja los links como están y lo
+  que quedó a medias se vuelve a ofrecer.
+- Mientras el robot trabaja, cerrar la ventana (o la de "Actualizar ruta")
+  pregunta si se cancela y cierra todo al terminar el paso en curso; si el
+  trabajo alcanzó a terminar, primero copia los links y avisa.
+- Antes de crear mapas se revisa si hay mapas hechos a mano para esa misma
+  entrega (no se duplican: se pregunta si se reemplazan). Al reemplazar una
+  entrega, primero se crean los mapas nuevos y después los anteriores van a
+  la papelera; si alguno no se puede mandar, deja de salir en la lista de
+  links y se reintenta la próxima vez.
+- Con rutas grandes (muchas capas y vendedores) el panel de My Maps se
+  desplaza: el robot trae cada fila a la vista antes de ponerle color, y si
+  un color no se puede poner solo avisa (no pierde el mapa por eso).
 
 Cómo funciona: My Maps no tiene API, así que `mymaps.py` maneja un **Chrome
 aparte** (perfil propio en `data\chrome-mymaps`) con Playwright. La sesión

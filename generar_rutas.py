@@ -1090,12 +1090,58 @@ def mapas_viejos(carpeta: Path):
 
 def abrir_ventana():
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, ttk
+    from tkinter import messagebox as _messagebox
+
+    class _Dialogos:
+        """messagebox que cuenta los avisos/preguntas abiertos de esta ventana:
+        la de My Maps no pregunta encima de ellos ni cierra todo con uno
+        abierto (Tk sigue atendiendo la otra ventana mientras tanto)."""
+        abiertos = 0
+
+        def __getattr__(self, nombre):
+            funcion = getattr(_messagebox, nombre)
+            if not callable(funcion):
+                return funcion
+
+            def envuelta(*args, **kwargs):
+                _Dialogos.abiertos += 1
+                try:
+                    return funcion(*args, **kwargs)
+                finally:
+                    _Dialogos.abiertos -= 1
+            return envuelta
+
+    messagebox = _Dialogos()
 
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+
+    class _CierreDiferido:
+        """Lo que la ventana de My Maps 'cierra' al terminar cuando se pidio
+        cerrar 'Actualizar ruta': vuelve a pasar por Ventana.al_cerrar, que
+        revisa si mientras tanto se empezo a publicar. Si hay un aviso o una
+        pregunta abiertos aqui, espera a que se cierren. confirmado: el
+        usuario ya dijo que se cierre aunque se estaba trabajando."""
+        def __init__(self, ventana, confirmado):
+            self.ventana, self.confirmado = ventana, confirmado
+
+        def destroy(self):
+            self.ventana.raiz.after_idle(self.cerrar)
+
+        def cerrar(self):
+            raiz = self.ventana.raiz
+            try:
+                if not raiz.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            if _Dialogos.abiertos:
+                raiz.after(500, self.cerrar)
+                return
+            self.ventana.al_cerrar(ya_confirmado=self.confirmado)
 
     class Ventana:
         def __init__(self, raiz):
@@ -1116,6 +1162,7 @@ def abrir_ventana():
             self.carpeta_ultima = None
             self.nota_sabado = False
             self.ocupado = False
+            self.control_pendiente = None       # lectura que llego con una pregunta abierta
             # Correcciones de ubicacion (sin las pendientes del Excel de
             # control): se traen de GitHub al leer el maestro y despues de
             # publicar. Con ellas se calcula quien no tiene georreferencia.
@@ -1130,6 +1177,7 @@ def abrir_ventana():
             # si la pantalla esta al 125%/150% para que nada quede apretado.
             self.escala = max(1.0, raiz.winfo_fpixels("1i") / 96)
             self.construir()
+            raiz.protocol("WM_DELETE_WINDOW", self.al_cerrar)
             raiz.after(100, self.revisar_cola)
             raiz.after(SEGUNDOS_VIGILANCIA * 1000, self.vigilar_control)
 
@@ -1360,7 +1408,12 @@ def abrir_ventana():
             elif tipo == "leido":
                 self.base_leida(*datos)
             elif tipo == "control":
-                self.control_leido(*datos)
+                if self.pausar_vigilancia:
+                    # Hay una pregunta abierta (publicar / aplicar): no se cambia
+                    # lo que se esta confirmando; se aplica al cerrarla.
+                    self.control_pendiente = datos
+                else:
+                    self.control_leido(*datos)
             elif tipo == "control_vigilado":
                 self.leyendo_control = False
                 self.fallos_vigilancia = 0
@@ -1385,6 +1438,14 @@ def abrir_ventana():
             elif tipo == "aviso":
                 self.ocupar(False, datos[0])
                 self.log(datos[0])
+            elif tipo == "pegar_resuelto":
+                cliente, largo, error = datos
+                self.ocupar(False)
+                if error:
+                    messagebox.showwarning("Pegar ubicación", f"El enlace no sirve como ubicación: {error}",
+                                           parent=self.raiz)
+                else:
+                    self.pegar_texto(cliente, largo)
             elif tipo == "overrides":
                 ya_estaban = self.overrides_listos
                 self.overrides_base, self.overrides_al_dia = datos
@@ -1415,6 +1476,10 @@ def abrir_ventana():
                 if len(datos) > 1 and datos[1]:
                     # Recien publicada la ruta: lo siguiente es subirla a My Maps.
                     self.abrir_mymaps(datos[1])
+                elif len(datos) > 2 and datos[2]:
+                    # Recien aplicadas ubicaciones: que My Maps tambien quede al dia
+                    # (si tocan mapas ya subidos, pregunta si se actualizan).
+                    self.abrir_mymaps(ofrecer_actualizar=True)
             elif tipo == "error":
                 self.ocupar(False, "Hubo un problema, revisa el mensaje.")
                 self.log("ERROR: " + datos[0])
@@ -1487,13 +1552,21 @@ def abrir_ventana():
             ruta y ubicaciones). Si falla, se sigue sin el."""
             self.cola.put(("control", self.leer_control_seguro()))
 
-        def leer_control_seguro(self):
+        def aplicar_control_pendiente(self):
+            """Lo leido del Excel de control mientras habia una pregunta
+            abierta. Si ya se empezo a trabajar, se descarta: al terminar se
+            vuelve a leer igual."""
+            pendiente, self.control_pendiente = self.control_pendiente, None
+            if pendiente is not None and not self.ocupado:
+                self.control_leido(*pendiente)
+
+        def leer_control_seguro(self, abrir_enlaces=True):
             """Lee el Excel de control; si no se puede (contraseña, daño,
             encabezado cambiado...), avisa y sigue SIN sus cambios, marcando
             el archivo como ilegible para no insistir en cada clic."""
             import control_rutas
             try:
-                return control_rutas.leer_editables()
+                return control_rutas.leer_editables(abrir_enlaces=abrir_enlaces)
             except Exception as e:
                 if not isinstance(e, ErrorRuta):
                     registrar_error(traceback.format_exc())
@@ -1743,8 +1816,29 @@ def abrir_ventana():
                 copiado = self.raiz.clipboard_get()
             except tk.TclError:
                 copiado = ""
+            if control_rutas.es_enlace_corto(copiado):
+                # El enlace que comparte el celular: se abre en segundo plano
+                # (necesita internet) y despues sigue igual.
+                self.ocupar(True, "Abriendo el enlace de Google Maps...")
+
+                def resolver():
+                    try:
+                        largo = control_rutas.resolver_enlace_corto(copiado)
+                    except ValueError as e:
+                        largo = None
+                        self.cola.put(("pegar_resuelto", c, None, str(e)))
+                    if largo is not None:
+                        self.cola.put(("pegar_resuelto", c, largo, None))
+                threading.Thread(target=resolver, daemon=True).start()
+                return
+            self.pegar_texto(c, copiado)
+
+        def pegar_texto(self, c, copiado):
+            import control_rutas
             try:
-                lat, lng = control_rutas.parsear_coordenada(copiado)
+                # Corre en la ventana: no sale a internet (los enlaces cortos
+                # ya se abrieron en segundo plano antes de llegar aqui).
+                lat, lng = control_rutas.parsear_coordenada(copiado, abrir_enlaces=False)
             except ValueError as e:
                 messagebox.showwarning("Pegar ubicación", f"Lo copiado no sirve como ubicación: {e}\n\nEn Google "
                                        "Maps: clic derecho sobre el local → clic en los números de arriba (se "
@@ -1853,8 +1947,12 @@ def abrir_ventana():
             import control_rutas
             if self.editables.get("mtime") == control_rutas.mtime_control():
                 return False
-            editables = self.leer_control_seguro()
+            # Corre en la ventana: los enlaces cortos nuevos no se abren aqui
+            # (puede tardar sin internet) sino enseguida en segundo plano.
+            editables = self.leer_control_seguro(abrir_enlaces=False)
             self.control_leido(editables)
+            if control_rutas.enlaces_sin_abrir(editables):
+                threading.Thread(target=self._leer_control, daemon=True).start()
             if editables.get("ilegible"):
                 messagebox.showwarning("Excel de control", f"El Excel de control cambió, pero: "
                                        f"{editables['ilegible']}\n\nSe sigue SIN sus cambios de ruta ni ubicaciones. "
@@ -1873,6 +1971,7 @@ def abrir_ventana():
                 self._preguntar_y_generar(publicar_mapa)
             finally:
                 self.pausar_vigilancia = False
+                self.aplicar_control_pendiente()
 
         def _preguntar_y_generar(self, publicar_mapa):
             if self.control_cambio():
@@ -2102,6 +2201,7 @@ def abrir_ventana():
                     return
             finally:
                 self.pausar_vigilancia = False
+                self.aplicar_control_pendiente()
             # Los que no tienen ubicacion SIN contar estas pendientes (son los que
             # hoy no salen en el mapa). Se calcula aqui, no desde el hilo.
             seleccion = armar_seleccion(self.camiones, self.incluidos, self.separados)
@@ -2127,7 +2227,7 @@ def abrir_ventana():
             # Los que siguen sin georreferencia vuelven arriba en UBICACIONES
             # (los que ya quedaron corregidos se descartan solos al armarlo).
             fin += self._actualizar_control(log, editables, None, estados, sin_georef=list(sin_base))
-            self.cola.put(("fin", fin))
+            self.cola.put(("fin", fin, None, aplicadas > 0))
 
         def abrir_carpeta(self):
             if self.carpeta_ultima and self.carpeta_ultima.is_dir():
@@ -2138,7 +2238,32 @@ def abrir_ventana():
             elif self.archivo_base:
                 os.startfile(self.archivo_base.parent)
 
-        def abrir_mymaps(self, carpeta=None):
+        def al_cerrar(self, ya_confirmado=False):
+            """Si la ventana de My Maps (que cuelga de esta) esta trabajando,
+            cerrar aqui la cerraria a medias: se le pregunta a ella y todo se
+            cierra cuando el robot termine el paso en curso (volviendo a pasar
+            por aqui, por si mientras tanto se empezo a publicar)."""
+            if self.ocupado and not ya_confirmado:
+                if not messagebox.askyesno(
+                        "Actualizar ruta", "Todavía se está trabajando (generar / publicar / leer). Si cierras "
+                        "ahora puede quedar a medias.\n\n¿Cerrar de todos modos?", icon="warning", default="no",
+                        parent=self.raiz):
+                    return
+                ya_confirmado = True
+            ventana_mm = getattr(sys.modules.get("ventana_mymaps"), "_abierta", None)
+            if ventana_mm is not None and ventana_mm.viva() and ventana_mm.trabajando:
+                ventana_mm.traer()
+                ventana_mm.al_cerrar(cerrar=_CierreDiferido(self, ya_confirmado))
+                return
+            self.raiz.destroy()
+
+        def ocupada_para_mymaps(self) -> bool:
+            """Si ahora no conviene que My Maps pregunte o arranque el robot:
+            aqui hay un aviso o pregunta abiertos, o se esta generando o
+            publicando (el robot usaria los MAPA mientras se reescriben)."""
+            return bool(self.ocupado or self.pausar_vigilancia or _Dialogos.abiertos)
+
+        def abrir_mymaps(self, carpeta=None, ofrecer_actualizar=False):
             try:
                 import ventana_mymaps
             except Exception:
@@ -2146,7 +2271,13 @@ def abrir_ventana():
                 messagebox.showerror("My Maps", "No se pudo abrir la ventana de My Maps (detalle en "
                                      "data/generador_error.log).", parent=self.raiz)
                 return
-            ventana_mymaps.abrir(self.raiz, carpeta or self.carpeta_ultima)
+            if not ofrecer_actualizar:
+                carpeta = carpeta or self.carpeta_ultima
+            # Al ofrecer actualizar (tras aplicar ubicaciones) no se cambia la
+            # carpeta que el usuario tenga elegida en la ventana de My Maps.
+            ventana_mm = ventana_mymaps.abrir(self.raiz, carpeta, ofrecer_actualizar)
+            if ventana_mm is not None:
+                ventana_mm.otra_ocupada = self.ocupada_para_mymaps
 
         def abrir_base_en_excel(self):
             if self.archivo_base and self.archivo_base.is_file():

@@ -76,6 +76,18 @@ class Cancelado(ErrorMyMaps):
     pass
 
 
+class _SinCuadro(ErrorMyMaps):
+    """My Maps no mostro un cuadro esperado al importar."""
+
+
+class MapaNoExiste(ErrorMyMaps):
+    """Al abrir el mapa, My Maps mando al inicio: esta en la papelera o se borro."""
+
+
+class _ImportacionVacia(Exception):
+    """My Maps cerro la importacion sin cargar nada (se reintenta una vez)."""
+
+
 # ---------------------------------------------------------------------------
 # Fechas, grupos y textos
 # ---------------------------------------------------------------------------
@@ -109,6 +121,85 @@ def fecha_de_carpeta(carpeta: Path):
         return datetime.strptime(carpeta.name[:10], "%Y-%m-%d").date()
     except ValueError:
         return None
+
+
+# Mapas hechos a mano antes del robot: "1-MAPA DE ENTREGAS LUNES 12 DE OCTUBRE".
+# El dia de la semana a veces esta mal escrito, asi que la fecha sale del
+# numero y el mes; el año, de la fecha que muestra My Maps en su lista.
+RE_TITULO = re.compile(r"^(\d+)\s*-\s*MAPA DE ENTREGAS\s+[A-Z]+\s+(\d{1,2})\s+DE\s+([A-Z]+)$")
+MESES_CORTOS = {"ENE": 1, "FEB": 2, "MAR": 3, "ABR": 4, "MAY": 5, "JUN": 6, "JUL": 7, "AGO": 8, "SEP": 9,
+                "SET": 9, "OCT": 10, "NOV": 11, "DIC": 12, "JAN": 1, "APR": 4, "AUG": 8, "DEC": 12}
+
+
+def _sin_tildes(texto: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(texto or ""))
+    return " ".join("".join(c for c in s if not unicodedata.combining(c)).upper().split())
+
+
+def fecha_de_lista(texto: str):
+    """Fecha que muestra la lista de My Maps: '13 oct 2026' o 'Tue Oct 13 2026'."""
+    t = _sin_tildes(texto).replace(".", "")
+    m = re.search(r"(\d{1,2}) ([A-Z]{3})[A-Z]* (\d{4})", t) or re.search(r"([A-Z]{3})[A-Z]* (\d{1,2}) (\d{4})", t)
+    if not m:
+        return None
+    a, b, anio = m.groups()
+    dia, mes = (a, b) if a.isdigit() else (b, a)
+    try:
+        return date(int(anio), MESES_CORTOS[mes[:3]], int(dia))
+    except (KeyError, ValueError):
+        return None
+
+
+def fecha_de_titulo(titulo: str, referencia: date):
+    """(numero, fecha de entrega) de un titulo de mapa de entregas, o None.
+    El año es el que deja la fecha mas cerca de `referencia`."""
+    m = RE_TITULO.match(_sin_tildes(titulo))
+    if not m:
+        return None
+    numero, dia, mes = int(m.group(1)), int(m.group(2)), m.group(3)
+    if mes not in MESES:
+        return None
+    opciones = []
+    for anio in (referencia.year - 1, referencia.year, referencia.year + 1):
+        try:
+            opciones.append(date(anio, MESES.index(mes) + 1, dia))
+        except ValueError:
+            pass
+    if not opciones:
+        return None
+    return numero, min(opciones, key=lambda d: abs((d - referencia).days))
+
+
+def registrar_manuales(registro: dict, encontrados, hoy: date) -> int:
+    """Anota en el registro los mapas de entregas hechos a mano (para que
+    salgan en la lista de links y se limpien a los 30 dias como los demas).
+    encontrados: [{mid, titulo, fecha_lista}]. Devuelve cuantos se anotaron."""
+    conocidos = {m.get("mid") for m in registro["mapas"]}
+    nuevos = 0
+    for e in encontrados:
+        if not e.get("mid") or e["mid"] in conocidos:
+            continue
+        datos = fecha_de_titulo(e.get("titulo", ""), e.get("fecha_lista") or hoy)
+        if not datos:
+            continue
+        numero, entrega = datos
+        if entrega > (e.get("fecha_lista") or hoy) + timedelta(days=7):
+            # La fecha de la lista (ultimo cambio) nunca es meses ANTES de la
+            # entrega: un mapa a mano no se hace con tanta anticipacion, asi
+            # que la entrega es del año anterior.
+            try:
+                entrega = entrega.replace(year=entrega.year - 1)
+            except ValueError:              # 29 de febrero
+                entrega = entrega.replace(year=entrega.year - 1, day=28)
+        registro["mapas"].append({
+            "mid": e["mid"], "titulo": e["titulo"], "descripcion": "", "transportistas": [], "capas": [],
+            "numero": numero, "fecha_entrega": entrega.isoformat(), "origen": "manual",
+            "url": f"https://www.google.com/maps/d/edit?mid={e['mid']}&usp=sharing",
+            "creado": (e.get("fecha_lista") or hoy).isoformat(), "estado": "activo"})
+        conocidos.add(e["mid"])
+        nuevos += 1
+    return nuevos
 
 
 ARCHIVO_PUBLICADO = "_publicado.json"     # lo escribe generar_rutas.anotar_publicado
@@ -219,7 +310,8 @@ def armar_mapas(archivos, fecha_entrega: date):
 
 def texto_para_compartir(mapas) -> str:
     """Para pegar en WhatsApp: titulo, transportistas y link de cada mapa."""
-    bloques = [f"{m['titulo']}\n{m['descripcion']}\n{m['url']}" for m in mapas if m.get("url")]
+    bloques = ["\n".join(x for x in (m.get("titulo"), m.get("descripcion"), m["url"]) if x)
+               for m in mapas if m.get("url")]
     return "\n\n".join(bloques)
 
 
@@ -251,13 +343,14 @@ def activos(registro: dict, fecha_entrega: str = None):
 
 def por_mandar_a_papelera(registro: dict, hoy: date, reemplazar_fecha: str = None):
     """Activos con entrega de hace mas de 30 dias, los de la fecha que se
-    reemplaza, y los que quedaron a medias en un intento anterior."""
+    reemplaza, y los que quedaron a medias en un intento anterior (o que no
+    se pudieron mandar al reemplazarlos)."""
     limite = (hoy - timedelta(days=DIAS_HISTORIAL)).isoformat()
     salida = []
     for m in registro["mapas"]:
         if not m.get("mid"):
             continue
-        if m.get("estado") in ("creando", "fallido"):
+        if m.get("estado") in ("creando", "fallido", "reemplazado"):
             salida.append(m)
         elif m.get("estado") == "activo" and (m.get("fecha_entrega", "") < limite
                                               or m.get("fecha_entrega") == reemplazar_fecha):
@@ -356,6 +449,113 @@ def preparar_copias(archivos, destino: Path, overrides: dict):
             wb.close()
         copias.append(copia)
     return copias, corregidas
+
+
+def _celda_huella(valor) -> str:
+    if valor is None:
+        return ""
+    if isinstance(valor, float):
+        return f"{valor:.6f}"
+    return str(valor).strip()
+
+
+def huella_capa(ruta: Path) -> str:
+    """Resumen de TODO lo que se subio en una capa (ubicaciones corregidas,
+    vendedor, razon, clientes...): si despues cambia (una correccion de
+    ubicacion o la ruta vuelta a publicar con otros datos), esa capa de My
+    Maps esta vieja y se puede sustituir sin cambiar el link."""
+    import hashlib
+    import openpyxl
+
+    wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+    try:
+        ws = wb.worksheets[0]
+        _encabezado(ws, ruta)
+        filas, encabezado = [], None
+        for valores in ws.iter_rows(values_only=True):
+            if not valores or all(v in (None, "") for v in valores):
+                continue
+            texto_fila = "|".join(_celda_huella(v) for v in valores).rstrip("|")
+            if encabezado is None:
+                encabezado = texto_fila
+            else:
+                filas.append(texto_fila)
+    finally:
+        wb.close()
+    return hashlib.sha1("\n".join([encabezado or ""] + sorted(filas)).encode("utf-8")).hexdigest()
+
+
+def _grupo_de_capas(nombres):
+    """Grupos de mapa (F1-F2, F3xx, FO...) de esos archivos MAPA."""
+    grupos = set()
+    for n in nombres:
+        m = RE_ARCHIVO.fullmatch(n)
+        if m:
+            grupos.add(grupo_de(m.group(1), m.group(2))[1])
+    return grupos
+
+
+def actualizables(registro: dict, hoy: date):
+    """Mapas que subio el robot, de hoy en adelante y con huellas: los unicos
+    que se pueden actualizar sin cambiar el link."""
+    hoy_iso = hoy.isoformat()
+    return [m for m in registro["mapas"]
+            if m.get("estado") == "activo" and m.get("origen") != "manual" and m.get("fecha_entrega", "") >= hoy_iso
+            and m.get("huellas") and m.get("carpeta")]
+
+
+def mapas_por_actualizar(registro: dict, overrides: dict, hoy: date, destino: Path):
+    """Mapas de My Maps de hoy en adelante con cambios desde que se subieron
+    (ubicaciones corregidas en el Excel de control, en la ventana o en el
+    mapa, o la ruta vuelta a publicar con otros datos en los mismos
+    camiones). Deja en `destino` las copias nuevas de las capas afectadas.
+    Devuelve (planes, avisos): planes = [{mapa, capas: {nombre: copia}}]."""
+    planes, avisos = [], []
+    revisadas = set()
+    for m in actualizables(registro, hoy):
+        huellas, carpeta = m["huellas"], Path(m["carpeta"])
+        if not carpeta.is_dir():
+            avisos.append(f"{m['titulo']}: no encuentro su carpeta ({carpeta.name}); no se puede revisar.")
+            continue
+        if cambiados_desde_publicar(carpeta):
+            avisos.append(f"{m['titulo']}: los archivos MAPA cambiaron después de publicar la ruta; vuelve a "
+                          "«Generar y publicar» y después actualiza My Maps (el link no cambia).")
+            continue
+        # Solo se sustituyen capas: si cambiaron los camiones o los cargues
+        # (otros archivos), hay que volver a subir la ruta.
+        actuales = {p.name for p in archivos_mapa(carpeta)}
+        propias = set(m.get("capas") or huellas)
+        # Capas de los mapas de esa misma entrega (un grupo de mas de 10
+        # camiones se parte en 2 mapas): no cuentan como camiones nuevos.
+        de_la_entrega = {c for o in activos(registro, m.get("fecha_entrega"))
+                         if o.get("carpeta") == m.get("carpeta") for c in (o.get("capas") or [])}
+        nuevos = actuales - propias - de_la_entrega
+        if not propias <= actuales or _grupo_de_capas(nuevos) & _grupo_de_capas(propias):
+            avisos.append(f"{m['titulo']}: cambiaron los camiones o cargues de la ruta después de subirla; "
+                          "vuelve a subirla a My Maps.")
+            continue
+        clave = (m["carpeta"], m.get("fecha_entrega"))
+        if clave not in revisadas:
+            # Un camion de un grupo que no tiene ningun mapa (p. ej. un FO
+            # nuevo): ningun mapa lo trae, hay que volver a subir la ruta.
+            revisadas.add(clave)
+            grupos_con_mapa = _grupo_de_capas(de_la_entrega)
+            sin_mapa = sorted(n for n in actuales - de_la_entrega if not _grupo_de_capas([n]) & grupos_con_mapa)
+            if sin_mapa:
+                avisos.append(f"Entrega del {fecha_larga(date.fromisoformat(m['fecha_entrega']))}: "
+                              f"{', '.join(sin_mapa)} no está en ningún mapa de My Maps; vuelve a subir la ruta.")
+        archivos = [carpeta / n for n in huellas]
+        faltan = revisar_georef(archivos, overrides)
+        if faltan:
+            avisos.append(f"{m['titulo']}: {len(faltan)} clientes sin ubicación; corrígelos primero.")
+            continue
+        sub = destino / m["mid"]
+        sub.mkdir(parents=True, exist_ok=True)
+        copias, _ = preparar_copias(archivos, sub, overrides)
+        capas = {c.name: c for c in copias if huella_capa(c) != huellas.get(c.name)}
+        if capas:
+            planes.append({"mapa": m, "capas": capas})
+    return planes, avisos
 
 
 # ---------------------------------------------------------------------------
@@ -577,20 +777,31 @@ class Robot:
         return self.pg.evaluate("""() => Array.from(document.querySelectorAll('[id$="-layer-items-container"]'))
             .map(e => e.id.split('-')[0])""")
 
+    IFRAME_SELECTOR = 'iframe[src*="docs.google.com/picker"]'
+
     def selector_de_archivos(self):
         """El cuadro "Selecciona un archivo que quieras importar" (un iframe
-        de Google Picker), cuando ya muestra la opcion "Subir"."""
-        for marco in self.pg.frames:
-            if "docs.google.com/picker" in marco.url:
-                try:
-                    if marco.get_by_text("Subir", exact=True).filter(visible=True).count():
-                        return marco
-                except Exception:
-                    pass
+        de Google Picker) visible y ya con la opcion "Subir". Se busca por el
+        iframe de la pagina y no por la lista de frames: esa lista a veces no
+        trae la direccion del cuadro (pasa al volver a importar) y no se
+        encontraba aunque estuviera en pantalla."""
+        iframes = self.pg.locator(self.IFRAME_SELECTOR)
+        try:
+            for i in range(iframes.count()):
+                elemento = iframes.nth(i)
+                if not elemento.is_visible():
+                    continue
+                cuadro = elemento.content_frame
+                if cuadro.get_by_text("Subir", exact=True).filter(visible=True).count():
+                    return cuadro
+        except Exception:
+            pass
         return None
 
     def abrir_selector(self, ly):
         pg = self.pg
+        if self.selector_de_archivos():
+            return              # sigue abierto de un intento anterior: se usa ese
         enlace = pg.locator(f"#{ly}-layerview-import-link")
         if not enlace.count():
             enlace = pg.get_by_text("Importar", exact=True).filter(visible=True).last
@@ -599,7 +810,7 @@ class Robot:
         # Solo si ni siquiera existe su iframe, el clic se perdio y se repite.
         if esperar(self.selector_de_archivos, 90, 1):
             return
-        if not any("docs.google.com/picker" in f.url for f in pg.frames):
+        if not pg.locator(self.IFRAME_SELECTOR).filter(visible=True).count():
             try:
                 enlace.click(timeout=5000)
             except Exception:
@@ -611,14 +822,25 @@ class Robot:
     def cuadro_visible(self, texto, segundos):
         cuadros = self.pg.locator('div[role="dialog"]').filter(has_text=texto).filter(visible=True)
         if not esperar(cuadros.count, segundos, 0.5):
-            raise ErrorMyMaps(f"No apareció el cuadro \"{texto}...\" al importar.")
+            raise _SinCuadro(f"No apareció el cuadro \"{texto}...\" al importar.")
         return cuadros.first
 
     def importar(self, ly, archivo: Path):
-        self.abrir_selector(ly)
-        self.subir_archivo(ly, archivo)
+        # A veces My Maps no termina una importacion y no dice nada (la capa
+        # queda vacia, sin ningun cuadro abierto): se repite una vez.
+        for intento in (1, 2):
+            self.abrir_selector(ly)
+            try:
+                # Cuando funciona, los clientes aparecen en segundos: si a los 40 s
+                # no hay nada (y no hay cuadros abiertos), se reintenta.
+                self.subir_archivo(ly, archivo, esperar_segundos=40 if intento == 1 else 180)
+                return
+            except _ImportacionVacia as e:
+                if intento == 2:
+                    raise ErrorMyMaps(str(e))
+                self.log(f"   My Maps no cargó {archivo.name}; se vuelve a importar.")
 
-    def subir_archivo(self, ly, archivo: Path):
+    def subir_archivo(self, ly, archivo: Path, esperar_segundos=180):
         pg = self.pg
         selector = self.selector_de_archivos()
         selector.get_by_text("Subir", exact=True).filter(visible=True).first.click()
@@ -626,10 +848,39 @@ class Robot:
         entrada.wait_for(state="attached", timeout=20000)
         entrada.set_input_files(str(archivo))
 
-        # Columnas de la ubicacion
-        # My Maps deja ocultos los cuadros de importaciones anteriores: hay
-        # que usar siempre el que esta visible.
+        sitios = pg.locator(f"#{ly}-layer-items-container div.un1lmc-pbTTYe-ibnC6b-KDwhZb")
+        try:
+            self.marcar_columnas(archivo)
+        except _SinCuadro as e:
+            # A veces My Maps no muestra el cuadro de columnas (sin aviso): si
+            # la capa sigue vacia, se vuelve a importar como cuando no carga.
+            if sitios.count():
+                raise
+            raise _ImportacionVacia(f"No se pudo importar {archivo.name}: {e}")
+        self.elegir_titulo()
+
+        if not esperar(lambda: sitios.count() > 0 and not pg.locator('div[role="dialog"]').filter(visible=True).count(),
+                       esperar_segundos, 1):
+            abiertos = pg.locator('div[role="dialog"]').filter(visible=True)
+            if abiertos.count():
+                raise ErrorMyMaps(f"No se pudo importar {archivo.name}: {abiertos.first.inner_text()[:300]}")
+            time.sleep(5)
+            if sitios.count():
+                return                  # termino justo ahora: no se reintenta (duplicaria los puntos)
+            barra = pg.locator("#butterbar-wrap")
+            aviso_google = barra.inner_text().strip() if barra.count() else ""
+            raise _ImportacionVacia(f"No se pudo importar {archivo.name}: no aparecieron los clientes"
+                                    + (f" (My Maps dijo: {aviso_google[:200]})" if aviso_google else ""))
+        aviso = pg.locator(f"#{ly}-layerview-error-infobox-text")
+        if aviso.count() and aviso.is_visible():
+            self.log(f"   Aviso de My Maps: {aviso.inner_text().strip()}")
+
+    def marcar_columnas(self, archivo: Path):
+        """Cuadro "Selecciona columnas...": latitud_y = Latitud, longitud_x = Longitud.
+        My Maps deja ocultos los cuadros de importaciones anteriores: hay que
+        usar siempre el que esta visible."""
         dlg = self.cuadro_visible("Selecciona columnas", 90)
+        anterior = None                 # burbuja usada para la columna anterior
         for columna, valor in (("latitud_y", "latitude"), ("longitud_x", "longitude")):
             id_etiqueta = dlg.locator('span[id^="upload-checkbox-label-"]', has_text=re.compile(rf"^{columna}$")) \
                 .first.get_attribute("id")
@@ -638,25 +889,57 @@ class Robot:
             casilla.scroll_into_view_if_needed()
             if casilla.get_attribute("aria-checked") != "true":
                 casilla.click()
-            pg.locator(f'[role="radio"][data-value="{valor}"]').filter(visible=True).first.click()
-            if not esperar(lambda: dlg.locator(f"#upload-checkbox-mapped-{numero}").inner_text().strip(), 5):
+            anterior = self.elegir_tipo_de_columna(valor, dlg, numero, anterior)
+            if not anterior:
                 raise ErrorMyMaps(f"No se pudo marcar la columna {columna} al importar {archivo.name}.")
-        dlg.get_by_role("button", name="Continuar").click()
+        continuar = dlg.get_by_role("button", name="Continuar")
+        if not esperar(lambda: continuar.is_enabled(), 5, 0.3):
+            raise ErrorMyMaps(f"My Maps no aceptó las columnas de ubicación al importar {archivo.name}.")
+        time.sleep(0.5)
+        continuar.click()
+        time.sleep(1)
 
-        # Titulo de cada punto: la Razon
+    def elegir_tipo_de_columna(self, valor, dlg, numero, anterior):
+        """Latitud/Longitud se elige en la burbuja de esa columna, que sale al
+        marcarla (cada columna tiene la suya). A veces la burbuja de la columna
+        anterior todavia no se cerro: se usa la que NO es la anterior y se
+        confirma que la columna quedo "(Latitud)"/"(Longitud)". Devuelve la
+        burbuja usada (o None si no se pudo)."""
+        pg = self.pg
+        anotada = dlg.locator(f"#upload-checkbox-mapped-{numero}")
+        esperado = "(latitud)" if valor == "latitude" else "(longitud)"
+        for _ in range(4):
+            burbuja = None
+            fin = time.time() + 6
+            while time.time() < fin and not burbuja:
+                visibles = pg.evaluate("""() => Array.from(document.querySelectorAll('[role="alertdialog"]'))
+                    .filter(b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0
+                                   && b.querySelector('[role="radio"][data-value]'); })
+                    .map(b => b.getAttribute('aria-describedby') || '')""")
+                nuevas = [b for b in visibles if b and b != anterior]
+                if len(nuevas) == 1:
+                    burbuja = nuevas[0]
+                else:
+                    time.sleep(0.3)
+            if burbuja:
+                try:
+                    pg.locator(f'[role="alertdialog"][aria-describedby="{burbuja}"] '
+                               f'[role="radio"][data-value="{valor}"]').first.click(timeout=6000)
+                except Exception as e:
+                    if not type(e).__module__.startswith("playwright"):
+                        raise
+            if esperar(lambda: anotada.inner_text().strip().lower() == esperado, 4, 0.3):
+                return burbuja or anterior or "?"
+            time.sleep(1)
+        return None
+
+    def elegir_titulo(self):
+        """Cuadro "Selecciona una columna...": el titulo de cada punto es la Razon."""
         dlg2 = self.cuadro_visible("Selecciona una columna", 30)
+        time.sleep(0.5)
         dlg2.locator('[role="radio"][data-value="Razon"]').click()
+        time.sleep(0.5)
         dlg2.get_by_role("button", name="Finalizar").click()
-
-        sitios = pg.locator(f"#{ly}-layer-items-container div.un1lmc-pbTTYe-ibnC6b-KDwhZb")
-        if not esperar(lambda: sitios.count() > 0 and not pg.locator('div[role="dialog"]').filter(visible=True).count(),
-                       180, 1):
-            abiertos = pg.locator('div[role="dialog"]').filter(visible=True)
-            detalle = abiertos.first.inner_text()[:300] if abiertos.count() else "no aparecieron los clientes"
-            raise ErrorMyMaps(f"No se pudo importar {archivo.name}: {detalle}")
-        aviso = pg.locator(f"#{ly}-layerview-error-infobox-text")
-        if aviso.count() and aviso.is_visible():
-            self.log(f"   Aviso de My Maps: {aviso.inner_text().strip()}")
 
     def elegir_del_menu(self, texto):
         opcion = self.pg.locator("div.VIpgJd-j7LFlb-bN97Pc").filter(visible=True).filter(
@@ -684,16 +967,44 @@ class Robot:
             popup.locator(".TvD9Pc, [aria-label='Cerrar']").first.click()
 
         categorias = pg.locator(f"#{ly}-layer-items-container div.un1lmc-pbTTYe-ibnC6b-JNdkSc")
+        sin_color = []
         for i in range(categorias.count()):
             fila = categorias.nth(i)
-            fila.hover()
-            fila.locator("div.un1lmc-pbTTYe-ibnC6b-DyVDA").click()
-            pg.locator("#stylepopup-color").wait_for(state="visible")
             r, g, b = PALETA[i % len(PALETA)]
+            if not self.color_de_fila(fila, r, g, b):
+                sin_color.append(fila.inner_text().split("(")[0].strip() or str(i + 1))
+        if sin_color:
+            # El color es solo para distinguir vendedores: no vale perder el mapa por eso.
+            self.log(f"   Aviso: no se pudo poner el color de {', '.join(sin_color)} (queda con el color "
+                     "por defecto; se puede cambiar a mano).")
+
+    def color_de_fila(self, fila, r, g, b) -> bool:
+        """Pone el color a un vendedor de la capa. El balde de pintura solo se
+        ve con el mouse encima de la fila, y con muchas capas el panel se
+        desplaza: se trae la fila a la vista y se vuelve a pasar el mouse."""
+        pg = self.pg
+        balde = fila.locator("div.un1lmc-pbTTYe-ibnC6b-DyVDA")
+        for _ in range(4):
+            self.revisar_cancelado()
+            try:
+                fila.scroll_into_view_if_needed(timeout=5000)
+                time.sleep(0.3)
+                fila.hover(timeout=5000)
+                balde.wait_for(state="visible", timeout=2500)
+                balde.click(timeout=5000)
+                pg.locator("#stylepopup-color").wait_for(state="visible", timeout=10000)
+            except Exception as e:
+                if type(e).__module__.startswith("playwright") or isinstance(e, TimeoutError):
+                    pg.mouse.move(5, 5)          # sacar el mouse y volver a intentar
+                    time.sleep(0.8)
+                    continue
+                raise
             pg.locator(f'#stylepopup-color [aria-label="RGB ({r}, {g}, {b})"]').click()
             hexa = f"{r:02x}{g:02x}{b:02x}"
             esperar(lambda: hexa in (fila.locator("[iconcode]").first.get_attribute("iconcode") or ""), 5)
             pg.locator("#stylepopup-close").click()
+            return True
+        return False
 
     def compartir(self) -> str:
         pg = self.pg
@@ -742,6 +1053,199 @@ class Robot:
         for ly in self.capas():
             if pg.locator(f'#{ly}-layer-header [role="checkbox"]').first.get_attribute("aria-checked") == "true":
                 raise ErrorMyMaps("Al volver a abrir el mapa, alguna capa quedó marcada.")
+
+    # -- mapas hechos a mano --------------------------------------------------
+    def mapas_propios(self):
+        """[{mid, titulo, fecha_lista}] de la lista "Propios" del inicio de My Maps."""
+        pg = self.pg
+        pg.goto(INICIO, wait_until="domcontentloaded")
+        tarjetas = pg.locator("[data-mid][data-name]")
+        if not esperar(tarjetas.count, 30, 1):
+            return []
+        pestana = pg.get_by_text(re.compile(r"^propios$", re.I)).filter(visible=True)
+        if pestana.count():
+            pestana.first.click()
+            time.sleep(2)
+        antes = -1
+        for _ in range(40):                     # la lista carga de a poco al bajar
+            n = tarjetas.count()
+            if n == antes:
+                break
+            antes = n
+            pg.evaluate("""() => { const t = Array.from(document.querySelectorAll('[data-mid][data-name]'))
+                .filter(e => e.getBoundingClientRect().height > 0); if (t.length) t[t.length - 1].scrollIntoView(); }""")
+            time.sleep(1.5)
+        datos = pg.evaluate("""() => { const vistos = {}; for (const e of document.querySelectorAll('[data-mid][data-name]')) {
+            const mid = e.getAttribute('data-mid'); if (vistos[mid]) continue;
+            let card = e; for (let k = 0; k < 6 && card && !/\\d{4}/.test(card.innerText || ''); k++) card = card.parentElement;
+            vistos[mid] = [e.getAttribute('data-name'), card ? ((card.innerText || '').split('\\n').filter(t => /\\d{4}/.test(t))[0] || '') : ''];
+        } return vistos; }""")
+        return [{"mid": mid, "titulo": nombre, "fecha_lista": fecha_de_lista(fecha)}
+                for mid, (nombre, fecha) in datos.items() if mid and not mid.startswith("dummy")]
+
+    # -- actualizar ubicaciones en un mapa ya subido -----------------------------
+    def capa_por_nombre(self, nombre):
+        for ly in self.capas():
+            if self.pg.locator(f"#{ly}-layer-header").inner_text().strip() == nombre:
+                return ly
+        return None
+
+    def orden_capas(self):
+        return [self.pg.locator(f"#{ly}-layer-header").inner_text().strip() for ly in self.capas()]
+
+    def abrir_opciones_capa(self, ly):
+        pg = self.pg
+        pg.keyboard.press("Escape")
+        cabecera = pg.locator(f"#{ly}-layer-header")
+        caja = cabecera.bounding_box()
+        # El boton de opciones aparece con la capa elegida (clic en la cabecera).
+        pg.mouse.click(caja["x"] + caja["width"] * 0.6, caja["y"] + caja["height"] / 2)
+        time.sleep(0.6)
+        cabecera.hover()
+        opciones = pg.locator(f'#{ly}-layer-header [aria-label="Opciones de la capa"]')
+        opciones.wait_for(state="visible", timeout=10000)
+        opciones.click()
+        time.sleep(0.6)
+
+    def item_menu(self, texto, sin=None):
+        items = self.pg.locator('[role="menuitem"]').filter(visible=True).filter(has_text=texto)
+        if sin:
+            items = items.filter(has_not_text=sin)
+        items.first.wait_for(state="visible", timeout=10000)
+        return items.first
+
+    def sustituir_capa(self, nombre, archivo: Path):
+        """Cambia todos los puntos de la capa por los del archivo ("Volver a
+        importar y combinar" → "Volver a importar" → "Sustituir todos los
+        elementos"): el mapa y su link siguen siendo los mismos."""
+        pg = self.pg
+        ly = self.capa_por_nombre(nombre)
+        if not ly:
+            raise ErrorMyMaps(f"En el mapa no está la capa {nombre}.")
+        # Al terminar de sustituir, My Maps deja la capa MARCADA (y la pasa al
+        # final): esa es la señal de fin. Por eso tiene que empezar desmarcada.
+        # (Los ids de los puntos no sirven: cambian solos y, con muchas capas,
+        # la lista de una capa fuera de la vista ni se dibuja.)
+        if self.capa_marcada(ly):
+            pg.locator(f'#{ly}-layer-header [role="checkbox"]').first.click()
+            if not esperar(lambda: not self.capa_marcada(ly), 10, 0.5):
+                raise ErrorMyMaps(f"No se pudo desmarcar la capa {nombre} antes de volver a importarla.")
+            time.sleep(1)
+        self.abrir_opciones_capa(ly)
+        self.item_menu("Volver a importar y combinar").hover()
+        time.sleep(0.6)
+        self.item_menu("Volver a importar", sin="combinar").hover()
+        time.sleep(0.6)
+        self.item_menu("Sustituir todos los elementos").click()
+        if not esperar(self.selector_de_archivos, 150, 1):
+            raise ErrorMyMaps("No se abrió la ventana para volver a importar el archivo.")
+        selector = self.selector_de_archivos()
+        selector.get_by_text("Subir", exact=True).filter(visible=True).first.click()
+        entrada = selector.locator("input[type=file]")
+        entrada.wait_for(state="attached", timeout=20000)
+        entrada.set_input_files(str(archivo))
+        # Normalmente recuerda las columnas; si las vuelve a pedir, se responden igual.
+        fin = time.time() + 180
+        while time.time() < fin:
+            time.sleep(1.5)
+            if self.pg.locator('div[role="dialog"]').filter(has_text="Selecciona columnas").filter(visible=True).count():
+                self.marcar_columnas(archivo)
+                continue
+            if self.pg.locator('div[role="dialog"]').filter(has_text="Selecciona una columna").filter(visible=True).count():
+                self.elegir_titulo()
+                continue
+            if self.selector_de_archivos() or pg.locator('div[role="dialog"]').filter(visible=True).count():
+                continue
+            nuevo = self.capa_por_nombre(nombre)
+            if nuevo and self.capa_marcada(nuevo):
+                time.sleep(2)
+                return self.capa_por_nombre(nombre)
+        raise ErrorMyMaps(f"No terminó de volver a importar {nombre}.")
+
+    def capa_marcada(self, ly) -> bool:
+        return self.pg.locator(f'#{ly}-layer-header [role="checkbox"]').first.get_attribute("aria-checked") == "true"
+
+    def mover_capa_arriba_de(self, ly_mover, ly_destino):
+        """Arrastra una capa para dejarla encima de otra (como una persona)."""
+        pg = self.pg
+        o = pg.locator(f"#{ly_mover}-layer-header").bounding_box()
+        d = pg.locator(f"#{ly_destino}-layer-header").bounding_box()
+        x0, y0 = o["x"] + o["width"] * 0.35, o["y"] + o["height"] / 2
+        pg.mouse.move(x0, y0)
+        time.sleep(0.3)
+        pg.mouse.down()
+        time.sleep(0.3)
+        pg.mouse.move(x0, y0 - 8, steps=4)
+        time.sleep(0.3)
+        pg.mouse.move(x0, d["y"] - 2, steps=30)
+        time.sleep(0.6)
+        pg.mouse.move(x0, d["y"] - 1, steps=2)
+        time.sleep(0.4)
+        pg.mouse.up()
+        time.sleep(2)
+
+    def ordenar_capas(self, orden):
+        """Deja las capas en el orden dado (las sustituidas quedan al final)."""
+        for i, nombre in enumerate(orden):
+            for _ in range(3):
+                actual = self.orden_capas()
+                if nombre not in actual or actual.index(nombre) == i:
+                    break
+                self.mover_capa_arriba_de(self.capa_por_nombre(nombre), self.capa_por_nombre(actual[i]))
+
+    def actualizar_mapa(self, mid, capas: dict, orden, tocadas=None):
+        """Sustituye las capas indicadas ({nombre: copia}) y deja el mapa como
+        siempre: estilo por vendedor, orden de capas y todas desmarcadas.
+        tocadas: lista donde se anota cada capa antes de empezar a cambiarla
+        (si algo falla, esas pueden haber quedado a medias)."""
+        pg = self.pg
+        self.mid_en_curso = mid
+        pg.goto(f"https://www.google.com/maps/d/edit?mid={mid}&hl=es", wait_until="domcontentloaded")
+        # Esperar a que se vean los nombres de las capas (la pagina carga en blanco un rato).
+        if not esperar(lambda: set(capas) <= set(self.orden_capas()), 60, 1):
+            if "/maps/d/home" in pg.url:
+                # Se llego al mapa y My Maps mando al inicio (lo hace con los
+                # mapas en la papelera o borrados).
+                raise MapaNoExiste("El mapa ya no existe o está en la papelera; no se pudo actualizar.")
+            faltan = sorted(set(capas) - set(self.orden_capas()))
+            raise ErrorMyMaps(f"En el mapa no están las capas {', '.join(faltan)} (¿se borraron a mano?).")
+        time.sleep(2)
+        for nombre, archivo in capas.items():
+            self.revisar_cancelado()
+            self.log(f"   capa {nombre}")
+            if tocadas is not None:
+                tocadas.append(nombre)
+            ly = self.sustituir_capa(nombre, archivo)
+            self.dar_estilo(ly)
+        # La capa sustituida pasa al final, pero a veces un rato despues: se
+        # recarga el mapa antes de ordenar para ver el orden de verdad.
+        self.esperar_guardado()
+        presentes = [n for n in orden if n in self.orden_capas()]
+        for intento in range(3):
+            pg.reload(wait_until="domcontentloaded")
+            esperar(lambda: set(presentes) <= set(self.orden_capas()), 60, 1)
+            time.sleep(2)
+            if self.orden_capas()[:len(presentes)] == presentes:
+                break
+            if intento == 2:
+                self.log("   Aviso: no se pudo dejar las capas en su orden de siempre (los puntos sí quedaron bien).")
+                break
+            try:
+                self.ordenar_capas(presentes)
+            except Cancelado:
+                raise
+            except Exception as e:
+                # Con muchas capas el panel se desplaza y arrastrar puede fallar;
+                # el orden es solo de presentacion: se reintenta y si no, aviso.
+                self.log(f"   (no se pudo mover una capa: {str(e).splitlines()[0][:100]})")
+            self.esperar_guardado()
+        for ly in self.capas():
+            casilla = pg.locator(f'#{ly}-layer-header [role="checkbox"]').first
+            if casilla.get_attribute("aria-checked") == "true":
+                casilla.click()
+                esperar(lambda: casilla.get_attribute("aria-checked") == "false", 5)
+        self.esperar_guardado()
+        self.verificar(len(orden))
 
     # -- papelera -----------------------------------------------------------
     def a_la_papelera(self, mid) -> None:
@@ -810,21 +1314,21 @@ def subir(carpeta: Path, fecha_entrega: date, log, cancelar=None, reemplazar=Fal
         with Robot(log, cancelar) as robot:
             log("Revisando la sesión de Google...")
             robot.asegurar_sesion()
-
-            viejos = por_mandar_a_papelera(registro, hoy, entrega if reemplazar else None)
-            if viejos:
-                log(f"Mandando a la papelera {len(viejos)} mapas (vencidos o reemplazados)...")
-            for m in viejos:
-                robot.revisar_cancelado()
-                try:
-                    robot.a_la_papelera(m["mid"])
-                    m["estado"], m["papelera"] = "papelera", datetime.now().isoformat(timespec="seconds")
-                except Cancelado:
-                    raise
-                except Exception as e:
-                    log(f"   Aviso: no se pudo mandar a la papelera \"{m.get('titulo')}\" ({e}). "
-                        "Se intenta de nuevo la próxima vez.")
-                guardar_registro(registro, registro_ruta)
+            ya_conocidos = {m.get("mid") for m in activos(registro, entrega)}
+            _anotar_manuales(robot, registro, hoy, log, registro_ruta)
+            hechos_a_mano = [m for m in activos(registro, entrega) if m.get("mid") not in ya_conocidos]
+            if hechos_a_mano:
+                # No se sabia de ellos al preguntar si se reemplazaba esa fecha.
+                raise ErrorMyMaps(
+                    f"Encontré {len(hechos_a_mano)} mapas hechos a mano para el {fecha_larga(fecha_entrega)}:\n"
+                    + "\n".join(f"• {m['titulo']}" for m in hechos_a_mano)
+                    + "\n\nYa quedaron en la lista de links. Vuelve a darle a «Subir a My Maps» y te pregunto "
+                      "si se reemplazan.\n(No se subió nada.)")
+            # Los anteriores de esa entrega (si se reemplaza) van a la papelera
+            # DESPUES de crear los nuevos: si algo falla a medias, los links de
+            # antes siguen sirviendo.
+            anteriores = activos(registro, entrega) if reemplazar else []
+            _mandar_a_papelera(robot, registro, por_mandar_a_papelera(registro, hoy), log, registro_ruta)
 
             for plan in planes:
                 robot.revisar_cancelado()
@@ -833,7 +1337,10 @@ def subir(carpeta: Path, fecha_entrega: date, log, cancelar=None, reemplazar=Fal
                     "titulo": plan["titulo"], "descripcion": plan["descripcion"],
                     "transportistas": plan["transportistas"], "capas": [a.name for a in plan["archivos"]],
                     "numero": plan["numero"], "fecha_entrega": entrega,
-                    "fecha_liq": (fecha_de_carpeta(carpeta) or hoy).isoformat(),
+                    "fecha_liq": (fecha_de_carpeta(carpeta) or hoy).isoformat(), "carpeta": str(carpeta),
+                    # Huella de lo subido en cada capa: si despues se corrige una
+                    # ubicacion, se sabe que capas hay que actualizar.
+                    "huellas": {a.name: huella_capa(a) for a in plan["archivos"]},
                     "creado": datetime.now().isoformat(timespec="seconds"), "estado": "creando",
                 }
                 registro["mapas"].append(entrada)
@@ -868,8 +1375,154 @@ def subir(carpeta: Path, fecha_entrega: date, log, cancelar=None, reemplazar=Fal
                 guardar_registro(registro, registro_ruta)
                 creados.append(entrada)
                 log(f"   Listo: {resultado['url']}")
+            if anteriores:
+                log(f"Ya están los nuevos; los {len(anteriores)} mapas anteriores del "
+                    f"{fecha_larga(fecha_entrega)} van a la papelera...")
+                _, fallidos = _mandar_a_papelera(robot, registro, anteriores, log, registro_ruta)
+                for m in fallidos:
+                    # Ya no cuenta como activo (no sale en el mensaje del dia ni
+                    # en los links); se vuelve a intentar la proxima vez.
+                    m["estado"] = "reemplazado"
+                if fallidos:
+                    guardar_registro(registro, registro_ruta)
+                    log("   Aviso: esos se mandan a la papelera la próxima vez; ya no salen en la lista de links.")
         limpiar_registro(registro, hoy)
         guardar_registro(registro, registro_ruta)
     finally:
         shutil.rmtree(temporal, ignore_errors=True)
     return creados
+
+
+def _anotar_manuales(robot, registro, hoy, log, registro_ruta):
+    """Suma al registro los mapas de entregas hechos a mano (para la lista
+    de links y la limpieza de 30 dias). Si falla, se sigue sin ellos."""
+    try:
+        n = registrar_manuales(registro, robot.mapas_propios(), hoy)
+        if n:
+            log(f"Se anotaron {n} mapas hechos a mano (se limpian a los {DIAS_HISTORIAL} días de su entrega).")
+            guardar_registro(registro, registro_ruta)
+    except Cancelado:
+        raise
+    except Exception as e:
+        log(f"   Aviso: no se pudo revisar la lista de mapas hechos a mano ({str(e).splitlines()[0][:120]}).")
+
+
+def _mandar_a_papelera(robot, registro, viejos, log, registro_ruta):
+    """Devuelve (enviados, fallidos)."""
+    if viejos:
+        log(f"Mandando a la papelera {len(viejos)} mapas (vencidos o reemplazados)...")
+    enviados, fallidos = [], []
+    for m in viejos:
+        robot.revisar_cancelado()
+        try:
+            robot.a_la_papelera(m["mid"])
+            m["estado"], m["papelera"] = "papelera", datetime.now().isoformat(timespec="seconds")
+            enviados.append(m)
+            log(f"   a la papelera: {m.get('titulo')}")
+        except Cancelado:
+            raise
+        except Exception as e:
+            fallidos.append(m)
+            log(f"   Aviso: no se pudo mandar a la papelera \"{m.get('titulo')}\" ({str(e).splitlines()[0][:150]}).")
+        guardar_registro(registro, registro_ruta)
+    return enviados, fallidos
+
+
+def limpiar(log, cancelar=None, registro_ruta: Path = ARCHIVO_REGISTRO, hoy: date = None):
+    """Solo la limpieza: anota los mapas hechos a mano y manda a la papelera
+    los de entrega de hace mas de 30 dias (y los que quedaron a medias).
+    Devuelve los que se mandaron a la papelera; si alguno no se pudo,
+    ErrorMyMaps al final (se reintenta la proxima vez)."""
+    hoy = hoy or date.today()
+    registro = leer_registro(registro_ruta)
+    with Robot(log, cancelar) as robot:
+        log("Revisando la sesión de Google...")
+        robot.asegurar_sesion()
+        _anotar_manuales(robot, registro, hoy, log, registro_ruta)
+        enviados, fallidos = _mandar_a_papelera(robot, registro, por_mandar_a_papelera(registro, hoy), log,
+                                                registro_ruta)
+    limpiar_registro(registro, hoy)
+    guardar_registro(registro, registro_ruta)
+    if fallidos:
+        listos = ("\n\nSí se mandaron:\n" + "\n".join(f"• {m.get('titulo')}" for m in enviados)) if enviados else ""
+        raise ErrorMyMaps(f"No se pudieron mandar a la papelera {len(fallidos)} mapas (se intenta de nuevo la "
+                          "próxima vez):\n" + "\n".join(f"• {m.get('titulo')}" for m in fallidos) + listos)
+    return enviados
+
+
+def actualizar_ubicaciones(log, cancelar=None, registro_ruta: Path = ARCHIVO_REGISTRO, overrides=None,
+                           hoy: date = None):
+    """Pasa a My Maps los cambios (ubicaciones corregidas o la ruta vuelta a
+    publicar): en cada mapa de hoy en adelante, sustituye solo las capas que
+    cambiaron (el link no cambia). Devuelve [(titulo, [capas])] actualizados.
+    Si algun mapa falla, se sigue con los demas y al final ErrorMyMaps con
+    cuales fallaron. Si no se pudo actualizar nada por un aviso (ruta sin
+    publicar, camiones cambiados...), ErrorMyMaps con los avisos."""
+    hoy = hoy or date.today()
+    if not actualizables(leer_registro(registro_ruta), hoy):
+        return []
+    if overrides is None:
+        from generar_rutas import overrides_vigentes
+        overrides, al_dia = overrides_vigentes()
+        if not al_dia:
+            # Con lo descargado la ultima vez se podria volver a poner una
+            # ubicacion vieja en My Maps: mejor no tocar nada.
+            raise ErrorMyMaps("Sin conexión con GitHub no se pueden revisar las ubicaciones corregidas. "
+                              "Vuelve a intentar con internet.")
+    registro = leer_registro(registro_ruta)
+    temporal = Path(tempfile.mkdtemp(prefix="mymaps_act_"))
+    hechos, fallidos = [], []
+    try:
+        planes, avisos = mapas_por_actualizar(registro, overrides, hoy, temporal)
+        for a in avisos:
+            log("Aviso: " + a)
+        if not planes:
+            if avisos:
+                raise ErrorMyMaps("No se actualizó nada en My Maps:\n" + "\n".join(f"• {a}" for a in avisos))
+            return hechos
+        por_mid = {m.get("mid"): m for m in registro["mapas"]}
+        with Robot(log, cancelar) as robot:
+            log("Revisando la sesión de Google...")
+            robot.asegurar_sesion()
+            for plan in planes:
+                robot.revisar_cancelado()
+                m = por_mid[plan["mapa"]["mid"]]
+                log(f"Actualizando {m['titulo']} ({len(plan['capas'])} capas)...")
+                tocadas = []
+                try:
+                    robot.actualizar_mapa(m["mid"], plan["capas"], m.get("capas") or list(plan["capas"]), tocadas)
+                except Exception as e:
+                    # Las capas que se empezaron a cambiar pueden haber quedado a
+                    # medias (o ya nuevas, pero sin ordenar): sin huella, se
+                    # vuelven a ofrecer y se rehacen.
+                    for nombre in tocadas:
+                        m.setdefault("huellas", {})[nombre] = ""
+                    guardar_registro(registro, registro_ruta)
+                    if isinstance(e, Cancelado):
+                        raise
+                    try:
+                        robot.pg.screenshot(path=str(CAPTURA_ERROR))
+                        log(f"   (Captura de la pantalla del error en {CAPTURA_ERROR})")
+                    except Exception:
+                        pass
+                    motivo = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+                    if isinstance(e, MapaNoExiste):
+                        # Lo mandaron a la papelera (o lo borraron) a mano: ya no se ofrece.
+                        m["estado"], m["papelera"] = "papelera", datetime.now().isoformat(timespec="seconds")
+                        guardar_registro(registro, registro_ruta)
+                        motivo = "ya no existe o está en la papelera (se deja de ofrecer)"
+                    log(f"   No se pudo: {motivo}")
+                    fallidos.append(f"{m['titulo']}: {motivo}")
+                    continue
+                for nombre, copia in plan["capas"].items():
+                    m.setdefault("huellas", {})[nombre] = huella_capa(copia)
+                m["actualizado"] = datetime.now().isoformat(timespec="seconds")
+                guardar_registro(registro, registro_ruta)
+                hechos.append((m["titulo"], sorted(plan["capas"])))
+                log("   Listo (mismo link).")
+    finally:
+        shutil.rmtree(temporal, ignore_errors=True)
+    if fallidos:
+        listos = ("\n\nSí se actualizaron:\n" + "\n".join(f"• {t}" for t, _ in hechos)) if hechos else ""
+        raise ErrorMyMaps("No se pudieron actualizar:\n" + "\n".join(f"• {f}" for f in fallidos) + listos)
+    return hechos

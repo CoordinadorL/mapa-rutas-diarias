@@ -142,18 +142,129 @@ def texto_coord(lat, lng) -> str:
 _NUM = r"(-?\d{1,3}(?:\.\d+)?)"
 
 
-def parsear_coordenada(valor):
+# Solo los caracteres de un enlace corto de verdad: asi no se arrastra una
+# comilla tipografica o un parentesis pegado al final al copiarlo.
+RE_ENLACE_CORTO = re.compile(r"(?<![\w.])(?:https?://)?(?:maps\.app\.goo\.gl|goo\.gl/maps)/[A-Za-z0-9_-]+"
+                             r"(?:\?[A-Za-z0-9_=&%.~-]*)?", re.IGNORECASE)
+_ENLACES_RESUELTOS = {}
+# Enlaces que de por si no sirven (Google dice que no existen): no se reintentan.
+_ENLACES_INVALIDOS = {}
+# Enlaces que no se pudieron abrir (sin internet, Google no respondio):
+# {corto: (cuando, clave de la lectura, motivo)}. La misma lectura (el mismo
+# guardado del Excel) no los reintenta durante SEGUNDOS_FALLIDO, para no
+# esperar el tiempo de espera en cada vuelta.
+_ENLACES_FALLIDOS = {}
+SEGUNDOS_FALLIDO = 60
+NO_LLEVA = "ese enlace corto no lleva a un punto de Google Maps"
+MAL_COPIADO = "el enlace corto está mal copiado; cópialo otra vez desde el celular o pega los números"
+SIN_INTERNET = ("no pude abrir el enlace corto (¿hay internet?); también puedes hacer clic "
+                "derecho sobre el punto en Google Maps y copiar los números")
+GOOGLE_NO_RESPONDE = ("Google no respondió al abrir el enlace corto ({}); intenta de nuevo en un momento "
+                      "o pega los números")
+NAVEGADOR = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/130.0 Safari/537.36")
+
+
+def es_enlace_corto(valor) -> bool:
+    # Tambien dentro de otro enlace codificado (Safe Links de Outlook, l.facebook.com...).
+    return bool(RE_ENLACE_CORTO.search(unquote(texto(valor))))
+
+
+def resolver_enlace_corto(valor, tiempo=12, abrir=True, recordar_fallo=None) -> str:
+    """El enlace largo al que lleva un enlace corto de Google Maps (el que se
+    comparte desde el celular: maps.app.goo.gl/...). Solo sigue las
+    redirecciones, sin descargar la pagina. Necesita internet; si no se puede,
+    ValueError con un mensaje para el usuario. Se recuerda lo ya resuelto.
+    abrir=False: solo lo ya sabido (no sale a internet; para no trabar la
+    ventana). recordar_fallo: clave de la lectura (la fecha del Excel): si
+    con esa misma clave ya fallo la conexion hace poco, no se reintenta."""
+    import urllib.error
+    import urllib.request
+    from urllib.parse import parse_qs, urljoin, urlparse
+
+    m = RE_ENLACE_CORTO.search(unquote(texto(valor)))
+    if not m:
+        return texto(valor)
+    corto = m.group(0).rstrip(".,;)")
+    if not corto.lower().startswith("http"):
+        corto = "https://" + corto
+    if corto in _ENLACES_RESUELTOS:
+        return _ENLACES_RESUELTOS[corto]
+    if corto in _ENLACES_INVALIDOS:
+        raise ValueError(_ENLACES_INVALIDOS[corto])
+    anterior = _ENLACES_FALLIDOS.get(corto)
+    if not abrir:
+        if anterior:
+            raise ValueError(f"{anterior[2]} (al guardar otra vez el Excel se vuelve a intentar)")
+        raise ValueError("todavía no se abrió el enlace corto (se abre solo en unos segundos si hay internet); "
+                         "vuelve a intentar en un momento, o pega los números (clic derecho sobre el punto en "
+                         "Google Maps)")
+    ahora = datetime.now().timestamp()
+    if (recordar_fallo is not None and anterior and anterior[1] == recordar_fallo
+            and ahora - anterior[0] < SEGUNDOS_FALLIDO):
+        raise ValueError(anterior[2])
+
+    def fallo(motivo, definitivo=False):
+        if definitivo:
+            _ENLACES_INVALIDOS[corto] = motivo
+        else:
+            _ENLACES_FALLIDOS[corto] = (ahora, recordar_fallo, motivo)
+        return ValueError(motivo)
+
+    class _NoSeguir(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    abridor = urllib.request.build_opener(_NoSeguir)
+    url = corto
+    for _ in range(6):
+        pedido = urllib.request.Request(url, headers={"User-Agent": NAVEGADOR, "Accept-Language": "es"})
+        try:
+            with abridor.open(pedido, timeout=tiempo):
+                break                                   # ya no redirige: es el destino
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+                url = urljoin(url, e.headers["Location"])
+            elif e.code in (400, 404, 410):
+                raise fallo(NO_LLEVA, definitivo=True)
+            else:
+                # 429 (demasiadas consultas), 5xx, 403 de un proxy...: pasajero.
+                raise fallo(GOOGLE_NO_RESPONDE.format(f"código {e.code}"))
+        except ValueError:
+            # Caracteres que no van en una direccion web (enlace mal copiado).
+            raise fallo(MAL_COPIADO, definitivo=True)
+        except Exception:
+            raise fallo(SIN_INTERNET)
+        # Pagina de consentimiento de Google: el destino va en ?continue=
+        if "consent." in urlparse(url).netloc:
+            seguir = parse_qs(urlparse(url).query).get("continue")
+            if seguir:
+                url = seguir[0]
+                break
+        if not es_enlace_corto(url):
+            break
+    _ENLACES_RESUELTOS[corto] = url
+    _ENLACES_FALLIDOS.pop(corto, None)
+    return url
+
+
+def parsear_coordenada(valor, abrir_enlaces=True):
     """(lat, lng) desde lo que se pegue: '-2.90012, -79.00456' (clic derecho
-    en Google Maps -> copiar), '-2,90012; -79,00456', o un enlace largo de
-    Google Maps. Lanza ValueError con un mensaje para el usuario."""
+    en Google Maps -> copiar), '-2,90012; -79,00456', un enlace largo de
+    Google Maps o uno corto de los que comparte el celular (se abre para ver
+    a donde lleva; con abrir_enlaces=False solo si ya se abrio antes).
+    Lanza ValueError con un mensaje para el usuario."""
     s = unquote(texto(valor))
     if not s:
         raise ValueError("vacía")
-    if "goo.gl" in s or "maps.app" in s:
-        raise ValueError("los enlaces cortos de Google Maps no traen la coordenada; en Google Maps haz "
-                         "clic derecho sobre el punto y copia los números")
+    if es_enlace_corto(s):
+        s = unquote(resolver_enlace_corto(s, abrir=abrir_enlaces))
+        if es_enlace_corto(s):
+            raise ValueError("ese enlace corto no lleva a un punto de Google Maps")
     par = None
-    patrones = [rf"!3d{_NUM}!4d{_NUM}", rf"[?&](?:q|query|ll|destination|daddr)={_NUM}\s*,\s*{_NUM}"]
+    patrones = [rf"!3d{_NUM}!4d{_NUM}", rf"[?&](?:q|query|ll|destination|daddr)={_NUM}\s*,\s*{_NUM}",
+                # Pin compartido / lugar por coordenadas: la coordenada va en la ruta.
+                rf"/maps/(?:search|place)/{_NUM}\s*,\s*\+?\s*{_NUM}"]
     # En un enlace de indicaciones (/dir/) o de busqueda (/search/) lo que va
     # despues de @ es el centro de la pantalla, no el cliente.
     if "/dir/" not in s and "/search/" not in s:
@@ -301,11 +412,22 @@ def _serializable(v):
     return v
 
 
-def leer_editables(ruta: Path = None) -> dict:
+COLUMNAS_CON_COORDENADA = ("Nueva coordenada", "Corrección vigente", "Coordenada del sistema")
+
+
+def enlaces_sin_abrir(editables: dict) -> bool:
+    """Si quedaron enlaces cortos sin abrir en UBICACIONES."""
+    return any(es_enlace_corto(f.get(c)) for f in (editables or {}).get("ubicaciones", [])
+               for c in COLUMNAS_CON_COORDENADA)
+
+
+def leer_editables(ruta: Path = None, abrir_enlaces=True) -> dict:
     """Lo que el usuario escribio en UBICACIONES y CAMBIOS DE RUTA, y la
     foto de las correcciones con que se armo el Excel. Si el Excel no
     existe, se toma del respaldo (data/control_editables.json). Si existe
-    pero no se puede leer, ErrorRuta con un mensaje para el usuario."""
+    pero no se puede leer, ErrorRuta con un mensaje para el usuario.
+    abrir_enlaces=False: los enlaces cortos solo se cambian si ya se
+    abrieron antes (no sale a internet: para leer desde la ventana)."""
     ruta = ruta or ARCHIVO_CONTROL
     vacio = {"ubicaciones": [], "cambios": [], "foto": None, "origen": "nuevo"}
     if not ruta.exists():
@@ -351,6 +473,15 @@ def leer_editables(ruta: Path = None) -> dict:
             copia.unlink()
         except OSError:
             pass
+    # Enlaces cortos de Google Maps (los que comparte el celular): se abren
+    # aqui, que casi siempre corre en segundo plano, para no trabar la ventana.
+    for f in ubic:
+        for columna in COLUMNAS_CON_COORDENADA:
+            if es_enlace_corto(f.get(columna)):
+                try:
+                    f[columna] = resolver_enlace_corto(f.get(columna), abrir=abrir_enlaces, recordar_fallo=mtime)
+                except ValueError:
+                    pass                        # se avisa al leer la coordenada
     editables = {"ubicaciones": ubic, "cambios": cambios, "foto": foto, "origen": "excel", "mtime": mtime}
     guardar_respaldo(editables)
     return editables
@@ -589,6 +720,21 @@ def es_fila_sin_geo(fila: dict) -> bool:
     return g.normalizar(fila.get("Estado")).startswith(MARCA_SIN_GEO)
 
 
+def _motivo_de_fila(fila: dict) -> str:
+    """El motivo (por que no tiene ubicacion) de una fila SIN GEORREFERENCIA.
+    Si ahi se pego una coordenada o un enlace, eso no es el motivo."""
+    if not es_fila_sin_geo(fila):
+        return ""
+    valor = texto(fila.get("Coordenada del sistema"))
+    if es_enlace_corto(valor):
+        return ""
+    try:
+        parsear_coordenada(valor, abrir_enlaces=False)
+        return ""
+    except ValueError:
+        return valor
+
+
 def _sin_georef_de_hoja(editables: dict):
     """Las filas SIN GEORREFERENCIA que ya estaban en la hoja y siguen sin
     coordenada, como lista de clientes (para conservarlas cuando no se pasa
@@ -615,7 +761,9 @@ def cambios_de_ubicacion(editables: dict):
     Devuelve (cambios, estados_por_fila). Borrar una fila nunca quita una
     correccion: para quitar se usa Accion = QUITAR. Si algo ya estaba asi
     no se decide aqui (con la foto, que puede ser vieja) sino al aplicar,
-    contra lo ultimo de GitHub."""
+    contra lo ultimo de GitHub. No sale a internet (corre en la ventana): los
+    enlaces cortos ya se abrieron al leer el Excel; si no se pudo, la fila
+    queda con el aviso."""
     foto = editables.get("foto") or {}
     cambios, estados, vistos = [], {}, set()
     for i, f in enumerate(editables.get("ubicaciones", [])):
@@ -635,9 +783,15 @@ def cambios_de_ubicacion(editables: dict):
                 if not (codigo and vigente):
                     continue
                 try:
-                    par = list(parsear_coordenada(vigente))
+                    par = list(parsear_coordenada(vigente, abrir_enlaces=False))
                 except ValueError:
                     par = None
+                    if es_enlace_corto(vigente):
+                        # Enlace corto que no se pudo abrir: se trata como si
+                        # estuviera en 'Nueva coordenada' para que salga su aviso
+                        # (y al rearmar el Excel se pasa a esa columna).
+                        nueva = vigente
+                        break
                 if par and not _cerca(antes, par):
                     nueva = vigente
                     break
@@ -661,7 +815,7 @@ def cambios_de_ubicacion(editables: dict):
             cambios.append({"fila": i, "codigo": codigo, "accion": "quitar", "antes": antes})
             continue
         try:
-            lat, lng = parsear_coordenada(nueva)
+            lat, lng = parsear_coordenada(nueva, abrir_enlaces=False)
         except ValueError as e:
             estados[i] = f"Nueva coordenada: {e}"
             continue
@@ -1015,7 +1169,7 @@ def construir_control(log=None, editables=None, estados_cambios=None, estados_ub
         cod = normalizar_codigo(f.get("Código"))
         if cod and (es_fila_sin_geo(f) or texto(f.get("Dirección")) or texto(f.get("Vendedor"))):
             extra.setdefault(cod, {"nombre": texto(f.get("Cliente")), "ruta": texto(f.get("Ruta (última vez)")),
-                                   "motivo": texto(f.get("Coordenada del sistema")) if es_fila_sin_geo(f) else "",
+                                   "motivo": _motivo_de_fila(f),
                                    "direccion": texto(f.get("Dirección")), "vendedor": texto(f.get("Vendedor"))})
     for cod, info in extra.items():
         if cod not in indice and info["nombre"]:
@@ -1032,6 +1186,11 @@ def construir_control(log=None, editables=None, estados_cambios=None, estados_ub
         if not nueva and cambio_de_fila.get(i, {}).get("accion") == "poner":
             # Pegada en otra columna (la de al lado): se pasa a 'Nueva coordenada'.
             nueva = texto_coord(cambio_de_fila[i]["lat"], cambio_de_fila[i]["lng"])
+        if not nueva and i not in cambio_de_fila:
+            # Enlace corto pegado en la columna de al lado que aun no se pudo
+            # abrir: se pasa a 'Nueva coordenada' (si no, se perderia).
+            otras = ["Corrección vigente"] + (["Coordenada del sistema"] if es_fila_sin_geo(f) else [])
+            nueva = next((texto(f.get(c)) for c in otras if es_enlace_corto(f.get(c))), "")
         accion = texto(f.get("Acción"))
         if not (nueva or accion or previo == FALTA_NUEVA):
             continue        # (incluye las SIN GEORREFERENCIA aun vacias: se regeneran abajo)

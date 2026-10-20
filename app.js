@@ -460,6 +460,13 @@
     return "$" + valor.toFixed(2);
   }
 
+  // Lo que el transportista cobra en cada factura: la "Suma de Total"
+  // (columna M del MAPA), no la "Suma de VentaNeta" (columna L). Si un dia
+  // viejo del historial no trae total, se muestra la venta como antes.
+  function montoCliente(cliente) {
+    return typeof cliente.total === "number" ? cliente.total : cliente.venta;
+  }
+
   function iconoColor(color, entregado) {
     return L.divIcon({
       className: "marcador-color" + (entregado ? " entregado" : ""),
@@ -608,7 +615,7 @@
         "<b>" + (i + 1) + ". " + escaparHtml(cliente.nombre) + "</b><br>" +
         escaparHtml(cliente.direccion) + "<br>" +
         (cliente.vendedor ? '<span class="canal">Vendedor ' + escaparHtml(cliente.vendedor) + "</span>" : "") +
-        (cliente.venta ? '<div class="venta">' + formatoMoneda(cliente.venta) + "</div>" : "") +
+        (montoCliente(cliente) ? '<div class="venta">' + formatoMoneda(montoCliente(cliente)) + "</div>" : "") +
         '<div class="fila-navegar">' +
         '<a class="btn-navegar btn-maps" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=' + pos[0] + "," + pos[1] + '">Maps</a>' +
         '<a class="btn-navegar btn-waze" target="_blank" rel="noopener" href="https://waze.com/ul?ll=' + pos[0] + "," + pos[1] + '&navigate=yes">Waze</a>' +
@@ -670,10 +677,11 @@
       var v = c.vendedor || "";
       if (!v) return;
       if (!vistos[v]) {
-        vistos[v] = { vendedor: v, color: c.color, pedidos: 0 };
+        vistos[v] = { vendedor: v, color: c.color, pedidos: 0, total: 0 };
         vendedores.push(vistos[v]);
       }
       vistos[v].pedidos++;
+      vistos[v].total += montoCliente(c) || 0;
     });
 
     if (!vendedores.length) {
@@ -683,7 +691,9 @@
     }
 
     leyendaEl.innerHTML = vendedores.map(function (v) {
-      return '<span class="chip-vendedor"><i style="background:' + v.color + '"></i>' + escaparHtml(v.vendedor) + " (" + v.pedidos + ")</span>";
+      // "FO12 (32 - $1500.05)": pedidos y total en dolares que lleva de ese vendedor.
+      return '<span class="chip-vendedor"><i style="background:' + v.color + '"></i>' + escaparHtml(v.vendedor) +
+        " (" + v.pedidos + (v.total ? " - " + formatoMoneda(v.total) : "") + ")</span>";
     }).join("");
     leyendaEl.classList.remove("oculto");
   }

@@ -20,6 +20,7 @@ temporal):  python servicio_web.py --prueba
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,7 @@ import generar_rutas as gr
 import mymaps
 
 PUERTO = 5178
-VERSION = "1"
+VERSION = "2"
 ORIGENES_PERMITIDOS = {
     "https://coordinadorl.github.io",
     "http://localhost:8080",        # pruebas de la app en esta PC
@@ -43,6 +44,7 @@ ORIGENES_PERMITIDOS = {
 }
 LINEAS_LOG = 300
 MODO_PRUEBA = "--prueba" in sys.argv
+INSTANCIA = f"{os.getpid()}-{int(time.time())}"
 
 
 def ahora():
@@ -93,7 +95,13 @@ class Controlador:
         return {"ok": True}
 
     def preguntar(self, titulo, texto, accion, datos=None):
+        """Una sola pregunta a la vez (como un askyesno): si ya hay otra
+        abierta no se reemplaza (su 'Si' se perderia), se avisa."""
         with self.lock:
+            if self.pregunta is not None:
+                self.avisar("aviso", titulo, "No se pudo preguntar porque había otra pregunta abierta: contéstala y "
+                                             "vuelve a intentar.")
+                return {"ok": False, "error": "Primero contesta la pregunta que está abierta.", "ya_avisado": True}
             self.pregunta_n += 1
             self.pregunta = {"id": self.pregunta_n, "titulo": titulo, "texto": texto,
                              "accion": accion, "datos": datos, "version": self.version}
@@ -107,6 +115,14 @@ class Controlador:
             self.pregunta = None
         try:
             self.al_responder(p, bool(cuerpo.get("si")))
+        except gr.ErrorRuta as e:
+            self.fallo(str(e))
+        except PermissionError as e:
+            self.fallo(f"No pude guardar:\n{e.filename}\n\n¿Está abierto en Excel? Ciérralo y vuelve a intentar.")
+        except Exception:
+            detalle = traceback.format_exc()
+            gr.registrar_error("(servicio web)\n" + detalle)
+            self.fallo("Algo falló inesperadamente:\n\n" + detalle.strip().splitlines()[-1])
         finally:
             self.despues_de_pregunta()
         return {"ok": True}
@@ -114,14 +130,21 @@ class Controlador:
     def al_responder(self, pregunta, si):
         raise NotImplementedError
 
+    def fallo(self, texto):
+        """Un error al contestar una pregunta: siempre le llega al usuario."""
+        self.log("ERROR: " + texto)
+        self.avisar("error", "No se pudo completar", texto)
+
     def despues_de_pregunta(self):
         pass
 
     def base_estado(self):
         p = self.pregunta
+        # instancia: cambia en cada arranque del servicio; la pagina la usa para
+        # darse cuenta de que el servicio se reinicio (los id vuelven a 1).
         return {"log": list(self.log_lineas), "avisos": list(self.avisos),
                 "pregunta": {k: p[k] for k in ("id", "titulo", "texto")} if p else None,
-                "version": self.version}
+                "version": self.version, "instancia": INSTANCIA}
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +170,7 @@ class Generador(Controlador):
         self.cambios_ubic = []
         self.estados_ubic = {}
         self.carpeta_ultima = None
+        self.carpeta_ultima_dia = None
         self.nota_sabado = False
         self.ocupado = False
         self.mensaje = ""
@@ -161,6 +185,11 @@ class Generador(Controlador):
         self.tabla = []
         self.resumen = ""
         self.mymaps_sugerido = None         # tras publicar: ir a My Maps con esa carpeta
+        self.base_mtime = None              # cuando se guardo el archivo base que se leyo
+        self.lectura_dia = None             # que dia se leyo (otro dia = empezar de cero)
+        self.lectura_n = 0                  # para descartar una lectura que ya no es la vigente
+        # My Maps lo cambia por "el robot esta trabajando" (usa los MAPA).
+        self.otra_ocupada = lambda: False
         threading.Thread(target=self._vigilar_control, daemon=True).start()
 
     # -- utilidades --------------------------------------------------------
@@ -193,6 +222,9 @@ class Generador(Controlador):
         self.log("ERROR: " + texto)
         self.avisar("error", "No se pudo completar", texto)
 
+    def fallo(self, texto):
+        self.error(texto)
+
     def mensaje_listo(self):
         if not self.fechas:
             return ""
@@ -205,39 +237,103 @@ class Generador(Controlador):
 
     # -- archivo base --------------------------------------------------------
     def iniciar(self, cuerpo=None):
+        """Al abrir la pagina. El servicio queda abierto de un dia para otro,
+        asi que:
+        - otro dia (o nunca se leyo): como abrir la ventana de cero, con la
+          configuracion recordada, camiones segun lo guardado y el archivo
+          base mas reciente;
+        - mismo dia y el archivo base se guardo despues de leerlo (se pegaron
+          ventas): se vuelve a leer ESE archivo (aunque se haya elegido otro
+          con "Cambiar archivo...");
+        - mismo dia y nada cambio (ir a My Maps y volver, F5): se deja todo
+          como estaba, igual que la ventana que seguia abierta.
+        Si se esta trabajando o hay una pregunta abierta, no se toca nada."""
         with self.lock:
-            if self.iniciado:
+            if self.ocupado or self.pregunta:
                 return {"ok": True}
+            if self.archivo_base and self.lectura_dia == date.today():
+                try:
+                    mtime = self.archivo_base.stat().st_mtime
+                except OSError:
+                    mtime = None
+                if mtime is not None and mtime == self.base_mtime:
+                    return {"ok": True}
+                if mtime is not None:
+                    self.cargar_base(self.archivo_base)
+                    return {"ok": True}
             self.iniciado = True
-        base = gr.buscar_base_reciente(self.config)
-        if base:
-            self.cargar_base(base)
-        else:
-            with self.lock:
+            self.config = gr.cargar_config()
+            self.incluidos, self.separados = {}, {}
+            base = gr.buscar_base_reciente(self.config)
+            if base:
+                self.cargar_base(base)
+            else:
+                self.archivo_base = None
+                self.filas, self.camiones, self.fechas, self.marcadas = [], [], [], set()
+                self.tabla, self.resumen, self.sin_georef = [], "", []
                 self.base_info = "Elige el archivo con \"Cambiar archivo...\"."
                 self.mensaje = "No encontré el archivo base."
                 self.cambio()
         return {"ok": True}
 
     def releer(self, cuerpo=None):
-        if self.ocupado:
-            return {"ok": False, "error": "Espera a que termine lo que se está haciendo."}
-        if self.archivo_base:
-            self.cargar_base(self.archivo_base)
+        with self.lock:
+            no = self._ocupado_o_pregunta()
+            if no:
+                return no
+            if self.archivo_base:
+                self.cargar_base(self.archivo_base)
         return {"ok": True}
 
     def elegir_base(self, cuerpo=None):
-        if self.ocupado:
-            return {"ok": False, "error": "Espera a que termine lo que se está haciendo."}
-        inicial = self.archivo_base.parent if self.archivo_base else gr.CARPETA_MAPAS_DIARIOS
-        ruta = elegir_archivo_windows(inicial)
-        if ruta:
+        with self.lock:
+            no = self._ocupado_o_pregunta()
+            if no:
+                return no
+            inicial = self.archivo_base.parent if self.archivo_base else gr.CARPETA_MAPAS_DIARIOS
+            # Mientras el cuadro de Windows esta abierto nada mas puede empezar
+            # (en la ventana el cuadro era modal).
+            self.ocupar(True, "Elige el archivo base en el cuadro de Windows (puede haber quedado detrás del "
+                              "navegador)...")
+        try:
+            ruta = elegir_archivo_windows(inicial)
+        finally:
+            self.ocupar(False)
+        if not ruta:
+            return {"ok": True, "cancelado": True}
+        with self.lock:
+            no = self._ocupado_o_pregunta()
+            if no:
+                return no
             self.cargar_base(Path(ruta))
-            return {"ok": True}
-        return {"ok": True, "cancelado": True}
+        return {"ok": True}
+
+    def base_cambio(self) -> bool:
+        """Si el archivo base se guardo despues de leerlo (se pegaron ventas
+        sin "Volver a leer"), se vuelve a leer y se pide revisar antes de
+        seguir: nunca se publica una lectura vieja."""
+        if not self.archivo_base:
+            return False
+        try:
+            mtime = self.archivo_base.stat().st_mtime
+        except OSError:
+            return False
+        if mtime == self.base_mtime:
+            return False
+        self.cargar_base(self.archivo_base)
+        self.avisar("info", "Archivo base", "El archivo base cambió desde que se leyó (se guardaron datos nuevos), "
+                    "así que se volvió a leer.\n\nRevisa la fecha y los camiones y vuelve a darle al botón.")
+        return True
 
     def cargar_base(self, ruta: Path):
         with self.lock:
+            self.lectura_n += 1
+            n = self.lectura_n
+            self.lectura_dia = date.today()
+            try:
+                self.base_mtime = ruta.stat().st_mtime
+            except OSError:
+                self.base_mtime = None
             self.archivo_base = ruta
             carpeta = ruta.parent
             if gr.CARPETA_MAPAS_DIARIOS in carpeta.parents:
@@ -258,13 +354,18 @@ class Generador(Controlador):
             self.overrides_listos = False
             self.ocupar(True, "Leyendo el archivo base...")
         threading.Thread(target=self._traer_overrides, daemon=True).start()
-        self.en_segundo_plano(self._leer, ruta)
+        self.en_segundo_plano(self._leer, ruta, n)
 
-    def _leer(self, ruta):
+    def _leer(self, ruta, n):
         inicio = time.time()
-        filas = gr.leer_base(ruta)
+        try:
+            filas = gr.leer_base(ruta)
+        except Exception:
+            if n != self.lectura_n:
+                return                      # lectura vieja: su error ya no importa (la nueva sigue)
+            raise
         self.control_leido(self.leer_control_seguro())
-        self.base_leida(filas, time.time() - inicio)
+        self.base_leida(n, filas, time.time() - inicio)
 
     def _traer_overrides(self):
         try:
@@ -325,8 +426,10 @@ class Generador(Controlador):
         if pendiente is not None and not self.ocupado:
             self.control_leido(pendiente)
 
-    def base_leida(self, filas, segundos):
+    def base_leida(self, n, filas, segundos):
         with self.lock:
+            if n != self.lectura_n:
+                return                      # ya se pidio otra lectura despues: esa es la que vale
             self.filas = filas
             fechas = sorted({f["Fecha Liq"] for f in filas}, reverse=True)
             sugeridas = gr.fechas_sugeridas(fechas)
@@ -487,10 +590,15 @@ class Generador(Controlador):
             camion = next((c for c in self.camiones if c["id"] == cid), None)
             if camion is None:
                 return {"ok": False, "error": "Ese camión ya no está en la lista."}
-            if cuerpo.get("campo") == "separar" and len(camion["liquidaciones"]) > 1:
-                self.separados[cid] = not self.separados.get(cid, False)
+            # La pagina manda el valor que quiere (no "alternar"): un doble clic
+            # no lo marca y desmarca (la ventana bloqueaba el doble clic).
+            if cuerpo.get("campo") == "separar":
+                if len(camion["liquidaciones"]) <= 1:
+                    return {"ok": False, "error": f"{cid} ya no tiene 2 cargues (la lista cambió). Revísala."}
+                self.separados[cid] = (bool(cuerpo["valor"]) if "valor" in cuerpo
+                                       else not self.separados.get(cid, False))
             else:
-                self.incluidos[cid] = not self.incluidos[cid]
+                self.incluidos[cid] = bool(cuerpo["valor"]) if "valor" in cuerpo else not self.incluidos[cid]
             self.pintar()
         return {"ok": True}
 
@@ -561,6 +669,10 @@ class Generador(Controlador):
         """'2. Pegar ubicacion copiada' de la ventana: la pagina manda lo que
         el usuario pego (coordenada o enlace de Google Maps)."""
         import control_rutas
+        # Esto usa git (puede tardar): se mira antes de tomar el lock, para que
+        # la revision y la pregunta de abajo queden juntas, sin hueco.
+        sin_subir = gr.ruta_sin_subir()
+        copiado = str(cuerpo.get("texto") or "").strip()
         with self.lock:
             no = self._ocupado_o_pregunta()
             if no:
@@ -572,34 +684,36 @@ class Generador(Controlador):
                 return {"ok": False, "error": f"El cliente {c['codigo']} ya tiene una fila pendiente en la hoja "
                                               "UBICACIONES del Excel de control (por ejemplo, QUITAR u otra "
                                               "coordenada). Corrígela o bórrala allí, para que una no pise a la otra."}
-        if gr.ruta_sin_subir():
-            return {"ok": False, "error": "Hay una ruta de una publicación anterior que no llegó a GitHub (se cortó "
-                                          "el internet), así que ahora no se puede guardar una ubicación sola.\n\n"
-                                          "Pega esta coordenada en el Excel de control (\"Varios: Excel de control\", "
-                                          "columna 'Nueva coordenada' del cliente), guarda y ciérralo: con eso se "
-                                          "habilita \"Generar y publicar\", que sube la ruta y las ubicaciones juntas."}
-        copiado = str(cuerpo.get("texto") or "").strip()
-        if control_rutas.es_enlace_corto(copiado):
+            if sin_subir:
+                return {"ok": False, "error": "Hay una ruta de una publicación anterior que no llegó a GitHub (se cortó "
+                                              "el internet), así que ahora no se puede guardar una ubicación sola.\n\n"
+                                              "Pega esta coordenada en el Excel de control (\"Varios: Excel de "
+                                              "control\", columna 'Nueva coordenada' del cliente), guarda y ciérralo: "
+                                              "con eso se habilita \"Generar y publicar\", que sube la ruta y las "
+                                              "ubicaciones juntas."}
+            if not control_rutas.es_enlace_corto(copiado):
+                return self._preguntar_ubicacion(c, copiado)
+            # El enlace que comparte el celular: se abre en segundo plano
+            # (necesita internet) y despues sigue igual.
             self.ocupar(True, "Abriendo el enlace de Google Maps...")
 
-            def resolver():
-                try:
-                    largo = control_rutas.resolver_enlace_corto(copiado)
-                except ValueError as e:
-                    self.ocupar(False)
-                    self.avisar("aviso", "Pegar ubicación", f"El enlace no sirve como ubicación: {e}")
-                    return
-                except Exception:
-                    gr.registrar_error(traceback.format_exc())
-                    self.ocupar(False)
-                    self.avisar("aviso", "Pegar ubicación", "No se pudo abrir el enlace (¿hay internet?).")
-                    return
+        def resolver():
+            try:
+                largo = control_rutas.resolver_enlace_corto(copiado)
+            except ValueError as e:
+                self.ocupar(False)
+                self.avisar("aviso", "Pegar ubicación", f"El enlace no sirve como ubicación: {e}")
+                return
+            except Exception:
+                gr.registrar_error(traceback.format_exc())
+                self.ocupar(False)
+                self.avisar("aviso", "Pegar ubicación", "No se pudo abrir el enlace (¿hay internet?).")
+                return
+            with self.lock:
                 self.ocupar(False)
                 self._preguntar_ubicacion(c, largo)
-            threading.Thread(target=resolver, daemon=True).start()
-            return {"ok": True}
-        r = self._preguntar_ubicacion(c, copiado)
-        return r
+        threading.Thread(target=resolver, daemon=True).start()
+        return {"ok": True}
 
     def _preguntar_ubicacion(self, c, copiado):
         import control_rutas
@@ -646,10 +760,18 @@ class Generador(Controlador):
                         "a leer con tus cambios.\n\nRevisa la lista de camiones y vuelve a darle al botón.")
         return True
 
+    def robot_trabajando(self):
+        if self.otra_ocupada():
+            return {"ok": False, "error": "El robot de My Maps está trabajando con los archivos MAPA: espera a que "
+                                          "termine (míralo en My Maps) y vuelve a intentar."}
+        return None
+
     def generar(self, cuerpo):
         publicar_mapa = bool(cuerpo.get("publicar"))
+        # Todo con el lock tomado (revisar, releer si cambio algo, preguntar):
+        # un doble clic o dos pestanas no pueden colarse en medio.
         with self.lock:
-            no = self._ocupado_o_pregunta()
+            no = self._ocupado_o_pregunta() or self.robot_trabajando()
             if no:
                 return no
             if not self.archivo_base or not self.camiones:
@@ -657,9 +779,8 @@ class Generador(Controlador):
             if publicar_mapa and not self.overrides_listos:
                 return {"ok": False, "error": "Todavía se están revisando las ubicaciones corregidas en GitHub. "
                                               "Espera unos segundos."}
-        if self.control_cambio():
-            return {"ok": True}
-        with self.lock:
+            if self.base_cambio() or self.control_cambio():
+                return {"ok": True}
             seleccion = gr.armar_seleccion(self.camiones, self.incluidos, self.separados)
             if not seleccion:
                 return {"ok": False, "error": "Marca al menos un camión."}
@@ -729,6 +850,7 @@ class Generador(Controlador):
             gr.guardar_config(self.config)
         carpeta = carpeta_de_salida(self.archivo_base, fechas)
         self.carpeta_ultima = carpeta
+        self.carpeta_ultima_dia = date.today()
         self.mymaps_sugerido = None
         self.ocupar(True, "Publicando..." if publicar_mapa else "Generando Excel...")
         self.en_segundo_plano(self._generar, seleccion, fechas, carpeta, publicar_mapa, list(self.cambios_ubic),
@@ -803,7 +925,7 @@ class Generador(Controlador):
             self.log("Aviso: no se pudo actualizar el Excel de control (detalle en data/generador_error.log).")
             return "\n\nOJO: el Excel de control no se pudo actualizar."
         finally:
-            self.control_leido(self.leer_control_seguro())
+            self._releer_control_sin_fallar()
         problemas = [e for e in (estados_ubic or {}).values() if not e.startswith(control_rutas.RESUELTOS)]
         if editables:
             problemas += list(control_rutas.cambios_de_ubicacion(editables)[1].values())
@@ -812,13 +934,25 @@ class Generador(Controlador):
                     "(mira la columna Estado en el Excel de control).")
         return ""
 
+    def _releer_control_sin_fallar(self):
+        """Releer el Excel de control despues de publicar/armarlo. Si falla,
+        no debe tapar lo que ya se hizo (una publicacion exitosa no puede
+        terminar mostrandose como error)."""
+        try:
+            self.control_leido(self.leer_control_seguro())
+        except Exception:
+            gr.registrar_error(traceback.format_exc())
+            self.log("Aviso: no se pudo volver a leer el Excel de control (detalle en data/generador_error.log).")
+
     # -- Excel de control / aplicar ubicaciones / abrir cosas en la PC ------------------
     def abrir_control(self, cuerpo=None):
-        no = self._ocupado_o_pregunta()
-        if no:
-            return no
-        self.ocupar(True, "Armando el Excel de control...")
-        self.en_segundo_plano(self._abrir_control, list(self.sin_georef))
+        with self.lock:
+            no = self._ocupado_o_pregunta()
+            if no:
+                return no
+            self.ocupar(True, "Armando el Excel de control...")
+            sin_georef = list(self.sin_georef)
+        self.en_segundo_plano(self._abrir_control, sin_georef)
         return {"ok": True}
 
     def _abrir_control(self, sin_georef=()):
@@ -844,17 +978,18 @@ class Generador(Controlador):
                           "\"Varios: Excel de control\".") if abierto else
                          (f"No se pudieron poner arriba los {len(sin_georef)} clientes sin georreferencia: {e}")) \
                     + ("\n\nTambién puedes corregirlos uno por uno en la lista en rojo.")
-        self.control_leido(self.leer_control_seguro())
+        self._releer_control_sin_fallar()
         self.ocupar(False, mensaje)
         abrir_en_pc(ruta, self)
         if aviso:
             self.avisar("info", "Excel de control", aviso)
 
     def aplicar_ubicaciones(self, cuerpo=None):
-        no = self._ocupado_o_pregunta()
-        if no:
-            return no
-        self.ocupar(True, "Leyendo el Excel de control...")
+        with self.lock:
+            no = self._ocupado_o_pregunta()
+            if no:
+                return no
+            self.ocupar(True, "Leyendo el Excel de control...")
         self.en_segundo_plano(self._preparar_ubicaciones)
         return {"ok": True}
 
@@ -923,6 +1058,12 @@ class Generador(Controlador):
                     self.avisar("aviso", "Publicar ruta", "La lista cambió mientras se preguntaba. Revísala y vuelve "
                                 "a darle a \"Generar y publicar en el mapa\".")
                     return
+                no = self.robot_trabajando()
+                if no:
+                    self.avisar("aviso", "Publicar ruta", no["error"])
+                    return
+                if self.base_cambio():
+                    return
                 self._arrancar_generar(True)
         elif p["accion"] == "guardar_ubicacion":
             d = p["datos"]
@@ -951,6 +1092,7 @@ class Generador(Controlador):
                 "sin_georef": self.datos_sin_georef(),
                 "botones": {"excel": hay, "publicar": hay and not self.sin_georef and self.overrides_listos},
                 "mymaps_sugerido": self.mymaps_sugerido,
+                "robot_trabajando": bool(self.otra_ocupada()),
                 "prueba": MODO_PRUEBA,
             }
             datos.update(self.base_estado())
@@ -983,11 +1125,26 @@ class MyMaps(Controlador):
         self.por_actualizar = []
         self.avisos_act = []
         self.ofrecer_actualizar = False
+        self.ofrecer_programado = False
         self.carpetas_texto = []
+        self._links = []
+        self._links_mtime = None
 
     def otra_ocupada(self):
+        return bool(self.motivo_otra_ocupada())
+
+    def motivo_otra_ocupada(self):
+        """Lo que en la ventana era ocupada_para_mymaps: en Generar mapas se
+        esta trabajando, hay una pregunta abierta o un mensaje sin ver (por
+        ejemplo, el error de una publicacion que fallo)."""
         g = self.generador
-        return bool(g.ocupado or g.pregunta)
+        if g.ocupado:
+            return "En Generar mapas se está trabajando (leyendo o publicando)."
+        if g.pregunta:
+            return "En Generar mapas hay una pregunta abierta sin contestar."
+        if any(a.get("tipo") in ("error", "aviso") for a in g.avisos):
+            return "En Generar mapas hay un mensaje sin ver."
+        return ""
 
     def ocupar(self, ocupado, mensaje=""):
         with self.lock:
@@ -995,16 +1152,34 @@ class MyMaps(Controlador):
             self.mensaje = mensaje
             self.cambio()
 
+    def fallo(self, texto):
+        with self.lock:
+            self.trabajando = False
+            self.trabajo = None
+            self.mensaje = "No se completó, revisa el mensaje."
+            self.cambio()
+        super().fallo(texto)
+
     def iniciar(self, cuerpo=None):
-        """Al abrir la pagina (como traer() de la ventana): vuelve a listar
-        las rutas del dia y busca mapas con cambios. carpeta: la recien
-        publicada en Generar mapas; ofrecer: preguntar si se actualizan."""
+        """Al abrir la pagina, como al abrir la ventana: vuelve a listar las
+        rutas del dia y busca mapas con cambios. Queda elegida la ruta que
+        llega en el link (la recien publicada), si no la ultima generada en
+        Generar mapas, y si no la mas nueva. Con 'ofrecer' (despues de
+        aplicar ubicaciones) no se cambia la que ya estaba elegida."""
         cuerpo = cuerpo or {}
         with self.lock:
             self.ofrecer_actualizar = self.ofrecer_actualizar or bool(cuerpo.get("ofrecer"))
             if self.trabajando:
                 return {"ok": True}
-            preferida = Path(cuerpo["carpeta"]) if cuerpo.get("carpeta") else self.carpeta_actual()
+            if cuerpo.get("carpeta"):
+                preferida = Path(cuerpo["carpeta"])
+            elif cuerpo.get("ofrecer") and self.carpeta_actual():
+                preferida = self.carpeta_actual()
+            else:
+                # La generada hoy en Generar mapas (el servicio queda abierto de
+                # un dia para otro: una de ayer no cuenta); si no, la mas nueva.
+                g = self.generador
+                preferida = g.carpeta_ultima if g.carpeta_ultima_dia == date.today() else None
         self.cargar_carpetas(preferida)
         self.buscar_actualizaciones()
         return {"ok": True}
@@ -1142,9 +1317,10 @@ class MyMaps(Controlador):
             return {"ok": False, "error": "Espera a que termine el trabajo en curso."}
         if self.pregunta:
             return {"ok": False, "error": "Primero contesta la pregunta que está abierta."}
-        if self.otra_ocupada():
-            return {"ok": False, "error": "En \"Generar mapas\" se está trabajando o hay una pregunta abierta: "
-                                          "termina eso primero (el robot usaría los MAPA mientras se reescriben)."}
+        motivo = self.motivo_otra_ocupada()
+        if motivo:
+            return {"ok": False, "error": motivo + " Ve allí y termina eso primero (el robot usaría los MAPA "
+                                                   "mientras se reescriben)."}
         return None
 
     def subir(self, cuerpo=None):
@@ -1284,9 +1460,15 @@ class MyMaps(Controlador):
             if type(e).__name__ == "ErrorRuta":
                 self._error(str(e))
             elif type(e).__module__.startswith("playwright"):
+                # "Subelo a mano" solo para la subida: tras actualizar o limpiar
+                # crearia mapas con links nuevos (lo mismo que la ventana).
+                if self.trabajo == "subir":
+                    consejo = "Vuelve a intentar; si se repite, súbelo a mano con los archivos de la carpeta del día."
+                else:
+                    consejo = "Vuelve a intentar."
                 self._error("My Maps no respondió como se esperaba (puede que Google haya cambiado algo en la página "
-                            "o que se haya cerrado el Chrome del robot).\n\nVuelve a intentar; si se repite, súbelo a "
-                            f"mano con los archivos de la carpeta del día.\n\nDetalle: {str(e).splitlines()[0][:200]}")
+                            f"o que se haya cerrado el Chrome del robot).\n\n{consejo}\n\n"
+                            f"Detalle: {str(e).splitlines()[0][:200]}")
             else:
                 self._error("Algo falló inesperadamente:\n\n" + traceback.format_exc().strip().splitlines()[-1])
 
@@ -1318,16 +1500,22 @@ class MyMaps(Controlador):
                 if not self.por_actualizar:
                     self.ofrecer_actualizar = False
                 self.cambio()
-            self.ofrecer_si_se_puede()
+                programado = self.ofrecer_programado
+            if not programado:
+                self.ofrecer_si_se_puede()
         threading.Thread(target=buscar, daemon=True).start()
 
     def ofrecer_si_se_puede(self):
         """Despues de corregir ubicaciones: preguntar enseguida si se pasan a
-        My Maps (cuando no haya otra pregunta ni trabajo, aqui ni en Generar)."""
+        My Maps (cuando no haya otra pregunta ni trabajo, aqui ni en Generar).
+        Un solo reintento programado a la vez (ofrecer_programado, como la
+        ventana)."""
         with self.lock:
+            self.ofrecer_programado = False
             if not self.ofrecer_actualizar or self.trabajando or not self.por_actualizar:
                 return
             if self.pregunta or self.otra_ocupada():
+                self.ofrecer_programado = True
                 threading.Timer(1.0, self.ofrecer_si_se_puede).start()
                 return
             self.ofrecer_actualizar = False
@@ -1335,6 +1523,25 @@ class MyMaps(Controlador):
 
     # -- links ------------------------------------------------------------------------
     def links(self):
+        """Links de los ultimos dias. Mientras el robot trabaja NO se lee el
+        registro: el robot lo reescribe muchas veces y en Windows, si justo
+        se esta leyendo, su os.replace falla y corta el trabajo. Fuera de eso
+        se relee solo si el archivo cambio (os.stat no estorba al robot)."""
+        if self.trabajando:
+            return self._links
+        try:
+            mtime = mymaps.ARCHIVO_REGISTRO.stat().st_mtime_ns
+        except (OSError, AttributeError):
+            mtime = None
+        # El dia tambien cuenta: "ultimos N dias" cambia aunque no se escriba nada.
+        clave = (mtime, date.today())
+        if mtime is not None and clave == self._links_mtime:
+            return self._links
+        self._links = self._leer_links()
+        self._links_mtime = clave
+        return self._links
+
+    def _leer_links(self):
         registro = mymaps.leer_registro()
         limite = (date.today() - timedelta(days=mymaps.DIAS_HISTORIAL)).isoformat()
         por_dia = {}
@@ -1355,6 +1562,9 @@ class MyMaps(Controlador):
         return salida
 
     def mensaje_dia(self, cuerpo):
+        if self.trabajando:
+            return {"ok": False, "error": "Espera a que termine el robot (está escribiendo el registro de mapas) y "
+                                          "vuelve a copiar el mensaje."}
         dia = cuerpo.get("dia") or ""
         mapas = sorted(mymaps.activos(mymaps.leer_registro(), dia), key=lambda m: m.get("numero", 0))
         if not mapas:
@@ -1391,6 +1601,7 @@ class MyMaps(Controlador):
                 "links": self.links(),
                 "dias_historial": mymaps.DIAS_HISTORIAL,
                 "otra_ocupada": self.otra_ocupada(),
+                "otra_motivo": self.motivo_otra_ocupada(),
                 "prueba": MODO_PRUEBA,
             }
             datos.update(self.base_estado())
@@ -1473,6 +1684,9 @@ def elegir_archivo_windows(inicial):
 
 GENERADOR = Generador()
 MYMAPS = MyMaps(GENERADOR)
+# Coordinacion en los dos sentidos: My Maps no arranca el robot si Generar esta
+# trabajando, y Generar no reescribe los MAPA mientras el robot los usa.
+GENERADOR.otra_ocupada = lambda: MYMAPS.trabajando
 
 RUTAS_POST = {
     "/generador/iniciar": GENERADOR.iniciar,
@@ -1535,7 +1749,10 @@ class Manejador(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(cuerpo)))
         self.end_headers()
-        self.wfile.write(cuerpo)
+        try:
+            self.wfile.write(cuerpo)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass                            # la pagina se cerro o corto la consulta: no es un error
 
     def do_OPTIONS(self):
         self.send_response(204 if self._origen_ok() else 403)
@@ -1588,6 +1805,8 @@ class Manejador(BaseHTTPRequestHandler):
     def _ejecutar(self, funcion, argumento):
         try:
             self._responder(200, funcion(argumento) or {"ok": True})
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass
         except gr.ErrorRuta as e:
             self._responder(200, {"ok": False, "error": str(e)})
         except Exception:
@@ -1597,14 +1816,57 @@ class Manejador(BaseHTTPRequestHandler):
                                                         + detalle.strip().splitlines()[-1]})
 
 
+class Servidor(ThreadingHTTPServer):
+    # En Windows, allow_reuse_address (que HTTPServer trae encendido) deja
+    # abrir el MISMO puerto dos veces: quedaban dos servicios con estados
+    # distintos (doble clic al .bat, o .bat + arranque con Windows). El puerto
+    # tiene que ser exclusivo para que el segundo vea que ya hay uno y se cierre.
+    allow_reuse_address = False
+    daemon_threads = True
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def avisar_si_hay_otro_viejo():
+    """El puerto ya esta ocupado. Si es este mismo servicio (misma version),
+    no pasa nada: se usa ese. Si es una version anterior (o no responde), se
+    avisa: si no, los arreglos nuevos no entrarian en uso y nadie lo notaria
+    (con pythonw no hay consola donde decirlo)."""
+    import urllib.request
+    version = None
+    try:
+        abridor = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        pedido = urllib.request.Request(f"http://127.0.0.1:{PUERTO}/salud",
+                                        headers={"Origin": "https://coordinadorl.github.io", "X-Opaustro": "1"})
+        with abridor.open(pedido, timeout=5) as r:
+            version = json.loads(r.read().decode("utf-8")).get("version")
+    except Exception:
+        pass
+    if version == VERSION or MODO_PRUEBA:
+        return
+    texto = ("Ya hay otro programa usando el servicio de mapas"
+             + (f" (una versión anterior, la {version})" if version else "")
+             + ", así que esta versión no pudo abrirse.\n\nReinicia la PC (el servicio arranca solo al prenderla) o "
+               "cierra 'pythonw' en el Administrador de tareas y vuelve a abrir \"SERVICIO MAPAS.bat\".")
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, texto, "Servicio de mapas", 0x30)
+    except Exception:
+        gr.registrar_error("(servicio web) " + texto)
+
+
 def main():
     try:
-        servidor = ThreadingHTTPServer(("127.0.0.1", PUERTO), Manejador)
+        servidor = Servidor(("127.0.0.1", PUERTO), Manejador)
     except OSError:
-        # Ya hay otro servicio abierto (doble clic dos veces): no pasa nada.
+        # Ya hay otro servicio abierto (doble clic dos veces, o ya arrancó con
+        # Windows): si es este mismo, no pasa nada, se usa ese.
         print(f"El servicio ya estaba funcionando en http://127.0.0.1:{PUERTO}")
+        avisar_si_hay_otro_viejo()
         return
-    servidor.daemon_threads = True
     print(f"Servicio de mapas en http://127.0.0.1:{PUERTO}" + ("  (MODO PRUEBA)" if MODO_PRUEBA else ""))
     servidor.serve_forever()
 

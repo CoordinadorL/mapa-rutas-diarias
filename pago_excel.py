@@ -866,20 +866,6 @@ def catalogos_del_excel(libro: Libro) -> dict:
     return cat
 
 
-def refrescar_resumen(libro: Libro):
-    if not libro.tiene_hoja(HOJA_RESUMEN):
-        return
-    ws = libro.hoja(HOJA_RESUMEN)
-    try:
-        for i in range(1, ws.PivotTables().Count + 1):
-            try:
-                ws.PivotTables(i).RefreshTable()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
 # ---------------------------------------------------------------------------
 # Sincronizacion
 # ---------------------------------------------------------------------------
@@ -1092,9 +1078,11 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
         # inicio del corte, si se programo un cambio para el corte nuevo).
         escribir_catalogos(activo, r, max(hoy, actual["desde"]))
     sesion.reanudar()       # calculo automatico otra vez (recalcula antes de guardar)
+    # RESUMEN no se toca: refrescar sus tablas dinamicas por programa las
+    # agranda encima de la tabla de detalle de al lado (Excel no pregunta con
+    # DisplayAlerts apagado). Se refrescan a mano, como siempre.
     for libro in libros:
         if libro.modificado:
-            refrescar_resumen(libro)
             sesion.guardar(libro.wb)
     guardar_foto(foto)
 

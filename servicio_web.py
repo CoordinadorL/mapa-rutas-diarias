@@ -36,7 +36,7 @@ import generar_rutas as gr
 import mymaps
 
 PUERTO = 5178
-VERSION = "3"
+VERSION = "4"
 ORIGENES_PERMITIDOS = {
     "https://coordinadorl.github.io",
     "http://localhost:8080",        # pruebas de la app en esta PC
@@ -1739,7 +1739,7 @@ class PagoTransportes(Controlador):
             import pago_excel
             r = pago_excel.sincronizar(self.log)
             self.ultima = {"hora": ahora(), "ok": bool(r.get("ok")), "mensaje": r.get("mensaje", ""),
-                           "archivo": r.get("archivo")}
+                           "archivo": r.get("archivo"), "corte": r.get("corte")}
             if r.get("avisos"):
                 self.avisos_sync = (r["avisos"] + self.avisos_sync)[:30]
         except pago_web.ErrorPago as e:

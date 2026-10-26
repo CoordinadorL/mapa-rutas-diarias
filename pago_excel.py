@@ -46,7 +46,9 @@ CARPETA_DOCS = Path.home() / "OneDrive" / "Documentos" / "2AVANCES DE RUTA Y MAP
 PATRON_ARCHIVO = "CAMIONES-AYUDANTES-FRECUENCIAS - *.xlsx"
 
 PREFIJOS_DIA = ["LNS", "MTS", "MCL", "JVS", "VNS", "SBD", "DMG"]
-RE_HOJA_DIA = re.compile(r"^(LNS|MTS|MCL|JVS|VNS|SBD|DMG)(\d{2})-(\d{2})$")
+# Pestanas de dia: LNS28-09, MTS29-09... (en archivos viejos tambien "MCLS23-09"
+# o "MRLS 26-08"): 2 a 4 letras, dia y mes.
+RE_HOJA_DIA = re.compile(r"^([A-Z]{2,4})\s*(\d{2})-(\d{2})$")
 MESES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE",
          "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
 HOJA_PLANTILLA = "BASE"
@@ -143,6 +145,39 @@ def nombre_hoja(d: date) -> str:
     return f"{PREFIJOS_DIA[d.weekday()]}{d:%d-%m}"
 
 
+# Cortes de pago: del 26 de un mes al 25 del siguiente, por fecha de
+# entrega. Cada corte tiene su propio Excel:
+# "CAMIONES-AYUDANTES-FRECUENCIAS - SEPTIEMBRE-OCTUBRE 2026.xlsx" (26/09-25/10).
+# Igual que PagoTransportes.gs (_pagoCorteDe) y pago-transportes.js (corteDe).
+DIA_CORTE = 25
+HOY = None      # solo para pruebas: otra fecha como "hoy" (para probar el cambio de corte)
+
+
+def corte_de(d: date) -> dict:
+    y1, m1 = d.year, d.month
+    if d.day <= DIA_CORTE:
+        m1 -= 1
+        if m1 == 0:
+            m1, y1 = 12, y1 - 1
+    y2, m2 = (y1 + 1, 1) if m1 == 12 else (y1, m1 + 1)
+    return {"id": f"{y2}-{m2:02d}", "nombre": f"{MESES[m1 - 1]}-{MESES[m2 - 1]} {y2}",
+            "desde": date(y1, m1, DIA_CORTE + 1), "hasta": date(y2, m2, DIA_CORTE)}
+
+
+def corte_anterior(corte: dict) -> dict:
+    return corte_de(corte["desde"] - timedelta(days=1))
+
+
+def corte_de_archivo(ruta: Path):
+    """'... - SEPTIEMBRE-OCTUBBRE 2026.xlsx' -> '2026-10' (los meses se
+    reconocen por sus 3 primeras letras: un error como OCTUBBRE no importa)."""
+    nombre = normalizar(ruta.stem)
+    anos = re.findall(r"(20\d\d)", nombre)
+    meses = [i + 1 for palabra in re.findall(r"[A-Z]+", nombre.split(" - ", 1)[-1])
+             for i, m in enumerate(MESES) if len(palabra) >= 3 and palabra[:3] == m[:3]]
+    return f"{int(anos[-1])}-{meses[-1]:02d}" if anos and meses else None
+
+
 def avisar(texto: str) -> None:
     try:
         ARCHIVO_AVISOS.parent.mkdir(exist_ok=True)
@@ -224,9 +259,11 @@ class SesionExcel:
     def __init__(self, usar_excel_abierto=True):
         self.usar_excel_abierto = usar_excel_abierto
         self.app = None
-        self.propios = []
+        self.propios = []           # (ruta, libro) abiertos por esta sesion
+        self.abiertos = {}          # ruta normalizada -> libro (abrir dos veces = el mismo)
         self.apps = []              # Excel usados (el del usuario y/o el propio)
         self.apps_pausadas = []     # (app, calculo anterior, pantalla anterior)
+        self.en_pausa = False
 
     def _usar(self, app):
         if not any(a is app for a in self.apps):
@@ -236,6 +273,7 @@ class SesionExcel:
         """Calculo manual y pantalla quieta mientras se escribe. Solo para
         escribir: leer no hace falta pausarlo (asi una sincronizacion sin
         cambios ni se nota en el Excel abierto del usuario)."""
+        self.en_pausa = True
         for app in self.apps:
             if any(a is app for a, _, _ in self.apps_pausadas):
                 continue
@@ -244,6 +282,26 @@ class SesionExcel:
             app.Calculation = -4135     # xlCalculationManual
 
     def abrir(self, ruta: Path):
+        clave = normalizar(str(Path(ruta).resolve()))
+        if clave not in self.abiertos:
+            self.abiertos[clave] = self._abrir(ruta)
+            if self.en_pausa:
+                self.pausar()       # un Excel que se sumo a mitad de la escritura
+        return self.abiertos[clave]
+
+    def cerrar_libro(self, ruta: Path):
+        clave = normalizar(str(Path(ruta).resolve()))
+        wb = self.abiertos.pop(clave, None)
+        for i, (r, propio) in enumerate(self.propios):
+            if propio is wb:
+                try:
+                    propio.Close(SaveChanges=False)
+                except Exception:
+                    pass
+                del self.propios[i]
+                break
+
+    def _abrir(self, ruta: Path):
         import pythoncom
         import win32com.client as w
         if self.usar_excel_abierto:
@@ -263,7 +321,16 @@ class SesionExcel:
                     self._usar(app_usuario)
                     return wb
         if self.app is None:
-            self.app = w.DispatchEx("Excel.Application")
+            # Recien cerrado otro Excel, Windows a veces no deja abrir uno
+            # nuevo al instante ("Error en la ejecucion de servidor").
+            for intento in range(4):
+                try:
+                    self.app = w.DispatchEx("Excel.Application")
+                    break
+                except pythoncom.com_error:
+                    if intento == 3:
+                        raise ErrorPago("No pude abrir Excel en esta PC. Se reintenta en la próxima sincronización.")
+                    time.sleep(3)
             self.app.Visible = False
             self.app.DisplayAlerts = False
             self.app.AskToUpdateLinks = False
@@ -273,7 +340,7 @@ class SesionExcel:
             except Exception:
                 self.pid = None
         wb = self.app.Workbooks.Open(str(ruta), UpdateLinks=0)
-        self.propios.append(wb)
+        self.propios.append((ruta, wb))
         if wb.ReadOnly:
             raise ErrorPago(f"\"{ruta.name}\" lo tiene abierto otra persona o programa: no se puede escribir. "
                             "Se reintenta en la próxima sincronización.")
@@ -289,6 +356,7 @@ class SesionExcel:
             except Exception:
                 pass
         self.apps_pausadas = []
+        self.en_pausa = False
 
     def guardar(self, wb):
         """Guardar con reintentos: si Excel esta ocupado, rechaza la llamada."""
@@ -304,7 +372,7 @@ class SesionExcel:
 
     def cerrar(self):
         self.reanudar()
-        for wb in self.propios:
+        for _, wb in self.propios:
             try:
                 wb.Close(SaveChanges=False)
             except Exception:
@@ -314,7 +382,7 @@ class SesionExcel:
                 self.app.Quit()
             except Exception:
                 pass
-        self.propios, self.app, self.apps = [], None, []
+        self.propios, self.app, self.apps, self.abiertos = [], None, [], {}
         self._esperar_que_termine()
 
     def _esperar_que_termine(self):
@@ -344,10 +412,11 @@ class SesionExcel:
 
 
 class Libro:
-    """Un archivo bimestral abierto: sus pestanas de dia y donde esta cada ID."""
+    """El Excel de un corte, abierto: sus pestanas de dia y donde esta cada ID."""
 
-    def __init__(self, ruta: Path, wb, es_activo: bool):
-        self.ruta, self.wb, self.es_activo = ruta, wb, es_activo
+    def __init__(self, ruta: Path, wb):
+        self.ruta, self.wb = ruta, wb
+        self.corte_id = corte_de_archivo(ruta)
         self.hojas = {}         # nombre -> HojaDia
         self.modificado = False
         for i in range(1, wb.Worksheets.Count + 1):
@@ -504,26 +573,96 @@ def _consolidado_agregar(libro: Libro, hoja_nombre: str, filas_origen):
         patron = fila
         if m.group(1).strip() == hoja_nombre:
             de_esta = i + 1
-    ancla = de_esta or despues
-    if ancla is None or patron is None:
-        return
+    ancla = de_esta or despues or FILA_ENCABEZADO
     # Columnas que el CONSOLIDADO trae de cada pestana (todas menos las que
-    # se saltean, ej. S).
+    # se saltean, ej. S). Un CONSOLIDADO vacio (corte nuevo) usa las de siempre.
     columnas = []
-    for j, f in enumerate(patron):
+    for j, f in enumerate(patron or ()):
         m = re_ref.match(str(f or ""))
         if m:
             columnas.append((j, m.group(2)))
+    if not columnas:
+        columnas = [(col_num(letra) - 1, letra) for letra in "ABCDEFGHIJKLMNOPQRTUV"]
+    ancho = max(j for j, _ in columnas) + 1
     n = len(filas_origen)
     ws.Range(ws.Rows(ancla + 1), ws.Rows(ancla + n)).Insert()
     nuevas = []
     for fila_origen in filas_origen:
-        fila = [""] * len(patron)
+        fila = [""] * ancho
         for j, letra in columnas:
             fila[j] = f"=+'{hoja_nombre}'!{letra}{fila_origen}"
         nuevas.append(tuple(fila))
-    ws.Range(ws.Cells(ancla + 1, 1), ws.Cells(ancla + n, len(patron))).Formula = tuple(nuevas)
+    ws.Range(ws.Cells(ancla + 1, 1), ws.Cells(ancla + n, ancho)).Formula = tuple(nuevas)
+    _consolidado_arreglar_sumas(ws)
     libro.modificado = True
+
+
+def _consolidado_arreglar_sumas(ws):
+    """Las sumas de abajo del CONSOLIDADO (=SUM(G4:G...) y =SUBTOTAL(9,G4:G...))
+    tienen que abarcar todas las filas: al insertar justo al principio o al
+    final del rango, Excel no las estira solo."""
+    ultima = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+    formulas = ws.Range(ws.Cells(PRIMERA_FILA, 7), ws.Cells(max(ultima, PRIMERA_FILA), 7)).Formula
+    if not isinstance(formulas, tuple):
+        formulas = ((formulas,),)
+    fila_suma = None
+    for i, (f,) in enumerate(formulas):
+        f = str(f or "").replace(" ", "").upper()
+        fila = PRIMERA_FILA + i
+        if fila_suma is None and f.startswith("=SUM(G"):
+            fila_suma = fila
+            ws.Range(f"G{fila}").Formula = f"=SUM(G{PRIMERA_FILA}:G{fila - 1})"
+        elif fila_suma is not None and f.startswith("=SUBTOTAL(9,G"):
+            ws.Range(f"G{fila}").Formula = f"=SUBTOTAL(9,G{PRIMERA_FILA}:G{fila_suma - 1})"
+
+
+def crear_archivo_corte(sesion: "SesionExcel", plantilla: Path, corte: dict, log=print) -> Path:
+    """El Excel de un corte que empieza: copia del archivo del corte anterior
+    (misma TARIFA, BASE, BASE DE TRANSPORTISTAS, RESUMEN...), sin sus pestanas
+    de dia ni sus filas en el CONSOLIDADO. Queda en la misma carpeta."""
+    destino = plantilla.parent / f"CAMIONES-AYUDANTES-FRECUENCIAS - {corte['nombre']}.xlsx"
+    if destino.exists():
+        return destino
+    import ctypes
+    import shutil
+    # CopyFileW copia aunque el anterior este abierto en Excel.
+    if not ctypes.windll.kernel32.CopyFileW(str(plantilla), str(destino), True):
+        shutil.copyfile(plantilla, destino)
+    try:
+        wb = sesion.abrir(destino)
+        dias = [wb.Worksheets(i) for i in range(1, wb.Worksheets.Count + 1)
+                if RE_HOJA_DIA.match(wb.Worksheets(i).Name.strip())]
+        nombres = {ws.Name.strip() for ws in dias}
+        # Primero las filas del CONSOLIDADO (si no, quedan en #REF!): todo lo
+        # que hay entre el encabezado y las sumas de abajo (las filas de cada
+        # dia y las filas de ceros que separan los dias), menos la ultima fila
+        # antes de las sumas, para que =SUM(G4:G4) siga teniendo un rango.
+        if any(normalizar(wb.Worksheets(i).Name) == HOJA_CONSOLIDADO for i in range(1, wb.Worksheets.Count + 1)):
+            ws = wb.Worksheets(HOJA_CONSOLIDADO)
+            ultima = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+            formulas = ws.Range(ws.Cells(PRIMERA_FILA, 7), ws.Cells(max(ultima, PRIMERA_FILA), 7)).Formula
+            if not isinstance(formulas, tuple):
+                formulas = ((formulas,),)
+            fila_suma = next((PRIMERA_FILA + i for i, (f,) in enumerate(formulas)
+                              if str(f or "").replace(" ", "").upper().startswith("=SUM(G")), None)
+            if fila_suma and fila_suma - 2 >= PRIMERA_FILA:
+                ws.Range(ws.Rows(PRIMERA_FILA), ws.Rows(fila_suma - 2)).Delete()
+            elif fila_suma is None:
+                raise ErrorPago(f"El CONSOLIDADO de {plantilla.name} no tiene la fila de la suma (=SUM): no sé cómo vaciarlo.")
+            _consolidado_arreglar_sumas(ws)
+        for ws in dias:
+            ws.Delete()
+        sesion.guardar(wb)
+    except Exception:
+        # Un archivo a medio armar no debe quedar como si fuera el corte.
+        sesion.cerrar_libro(destino)
+        try:
+            destino.unlink()
+        except OSError:
+            pass
+        raise
+    log(f"Pago a transportes: Excel del corte {corte['nombre']} creado ({destino.name}).")
+    return destino
 
 
 def crear_hoja_dia(libro: Libro, fecha: date, cuantas: int) -> HojaDia:
@@ -542,15 +681,19 @@ def crear_hoja_dia(libro: Libro, fecha: date, cuantas: int) -> HojaDia:
             antes_de = ws
             break
     plantilla = wb.Worksheets(HOJA_PLANTILLA)
+    antes = {wb.Worksheets(i).Name for i in range(1, wb.Worksheets.Count + 1)}
+    # Copy(Before, After) por POSICION: por COM, Copy(After=hoja) se ignora y
+    # la copia sale en un libro nuevo.
     if antes_de is not None:
-        plantilla.Copy(Before=antes_de)
-        ws = wb.Worksheets(antes_de.Index - 1)
+        plantilla.Copy(antes_de)
     else:
         ancla = wb.Worksheets(HOJA_CONSOLIDADO) if libro.tiene_hoja(HOJA_CONSOLIDADO) else wb.Worksheets(1)
         ultimo_dia = max((h for h in libro.hojas.values()), key=lambda h: h.ws.Index, default=None)
         ancla = ultimo_dia.ws if ultimo_dia else ancla
-        plantilla.Copy(After=ancla)
-        ws = wb.Worksheets(ancla.Index + 1)
+        plantilla.Copy(None, ancla)
+    # La copia se busca por nombre ("BASE (2)"), no por posicion: si despues
+    # del ancla hay hojas ocultas (RUTA DE CONTROL...), Excel la pone despues de ellas.
+    ws = next(wb.Worksheets(i) for i in range(1, wb.Worksheets.Count + 1) if wb.Worksheets(i).Name not in antes)
     ws.Name = nombre
     if ws.Visible != -1:
         ws.Visible = -1
@@ -624,7 +767,7 @@ def tarifas_vigentes(tarifas, hoy=None):
     return vigentes
 
 
-def escribir_catalogos(libro: Libro, cat: dict):
+def escribir_catalogos(libro: Libro, cat: dict, fecha: date = None):
     wb = libro.wb
     if libro.tiene_hoja(HOJA_TARIFA) and cat.get("tarifas"):
         ws = wb.Worksheets(HOJA_TARIFA)
@@ -637,7 +780,7 @@ def escribir_catalogos(libro: Libro, cat: dict):
             if cod:
                 filas[cod] = (3 + i, v)
                 ultima_cod = 3 + i
-        for cod, t in sorted(tarifas_vigentes(cat["tarifas"]).items()):
+        for cod, t in sorted(tarifas_vigentes(cat["tarifas"], fecha).items()):
             deseado = {1: cod, 2: t.get("ruta") or None, 3: t.get("distancia") or None,
                        4: t.get("tarifa_actual"), 7: t.get("pct_nueva"), 8: t.get("pct_6")}
             if cod in filas:
@@ -778,23 +921,37 @@ def sincronizar(log=print, carpeta=None) -> dict:
 
 
 def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
-    archivos = archivos_bimestrales(carpeta)[:2]
-    if not archivos:
-        raise ErrorPago("No encontré el Excel CAMIONES-AYUDANTES-FRECUENCIAS del bimestre en la carpeta "
+    todos = archivos_bimestrales(carpeta)
+    if not todos:
+        raise ErrorPago("No encontré el Excel CAMIONES-AYUDANTES-FRECUENCIAS en la carpeta "
                         "DOC COMPARTIDOS LOGÍSTICA Y CARTERA.")
     foto = cargar_foto()
     fotos = foto.setdefault("filas", {})
-    # El bimestre anterior solo se abre si tiene filas ya sincronizadas (para
-    # seguir recibiendo cambios de esos dias, ej. devoluciones que llegan tarde).
+    config = pago_web.cargar_config()
+    hoy = HOY or date.today()
+    actual = corte_de(hoy)
+    anterior = corte_anterior(actual)
+    # Desde que corte se suben a la web las filas escritas en el Excel sin ID:
+    # el del archivo mas nuevo cuando se sincronizo por primera vez (los
+    # archivos de cortes viejos no se cargan enteros).
+    primer_corte = config.get("primer_corte") or corte_de_archivo(todos[0]) or actual["id"]
+    por_corte = {}
+    for a in todos:                         # del mas nuevo al mas viejo
+        cid = corte_de_archivo(a)
+        if cid and cid not in por_corte:
+            por_corte[cid] = a
+    # Se abren el Excel del corte actual y el del anterior (devoluciones que
+    # llegan despues del 25), y los que ya tienen filas sincronizadas.
     con_filas = {f.get("_archivo") for f in fotos.values()}
-    archivos = archivos[:1] + [a for a in archivos[1:] if a.name in con_filas]
+    abrir = [por_corte[c["id"]] for c in (actual, anterior) if c["id"] in por_corte and c["id"] >= primer_corte]
+    abrir += [a for a in todos if a.name in con_filas and a not in abrir]
     pendientes = pago_web.enviar_pendientes(log)
-    libros = [Libro(r, sesion.abrir(r), i == 0) for i, r in enumerate(archivos)]
-    activo = libros[0]
+    libros = [Libro(r, sesion.abrir(r)) for r in abrir]
+    rechazadas = foto.setdefault("rechazadas", {})
 
     # 1) Excel -> web
     ubicacion = {}          # id -> (HojaDia, fila)
-    cambios, nuevas, por_tmp = [], [], {}
+    cambios, nuevas, por_tmp, vistas = [], [], {}, set()
     for libro in libros:
         for hoja in libro.hojas.values():
             for fila, f in hoja.filas.items():
@@ -806,13 +963,22 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
                             if not iguales(valor, antes.get(campo, "")):
                                 cambios.append({"id": f["id"], "campo": campo, "valor": valor,
                                                 "base": antes.get(campo, "")})
-                elif f["con_datos"] and libro.es_activo:
+                elif f["con_datos"] and (libro.corte_id or "") >= primer_corte:
                     tmp = f"XLS|{hoja.nombre}|{fila}"
                     datos = dict(f["datos"])
                     if not datos.get("fecha_entrega") and hoja.fecha:
                         datos["fecha_entrega"] = hoja.fecha.isoformat()
+                    firma = json.dumps(datos, sort_keys=True, default=str)
+                    vistas.add(tmp)
+                    # Una fila que la web ya rechazo (ej. corte cerrado) no se
+                    # vuelve a mandar mientras no cambie.
+                    if rechazadas.get(tmp) == firma:
+                        continue
                     nuevas.append(dict(datos, tmp=tmp, clave_carga=tmp, orden=fila - FILA_ENCABEZADO))
-                    por_tmp[tmp] = (hoja, fila)
+                    por_tmp[tmp] = (hoja, fila, firma)
+    for tmp in list(rechazadas):
+        if tmp not in vistas:
+            del rechazadas[tmp]
     # Filas que estaban en el Excel y ya no estan: las borraron a mano.
     eliminar = []
     for ident, antes in fotos.items():
@@ -822,28 +988,35 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
             eliminar.append({"id": ident, "base": {k: v for k, v in antes.items() if not k.startswith("_")}})
 
     fechas = [h.fecha for l in libros for h in l.hojas.values() if h.fecha]
-    desde = (min(fechas) if fechas else date.today() - timedelta(days=30)).isoformat()
+    desde = min(fechas + [anterior["desde"]]).isoformat()
     pedido = {"cambios": cambios, "nuevas": nuevas, "eliminar": eliminar, "desde": desde}
-    config = pago_web.cargar_config()
-    if not config.get("catalogos_subidos"):
-        pedido["catalogos_excel"] = catalogos_del_excel(activo)
+    if not config.get("catalogos_subidos") and libros:
+        pedido["catalogos_excel"] = catalogos_del_excel(libros[0])
     if cambios or nuevas or eliminar:
         log(f"Pago a transportes: subiendo del Excel {len(cambios)} cambios, {len(nuevas)} filas nuevas"
             + (f", {len(eliminar)} borradas" if eliminar else "") + "...")
     r = pago_web.llamar("pago_sync", pedido, timeout=180)
+    config = pago_web.cargar_config()
+    config["primer_corte"] = primer_corte
     if "catalogos_excel" in pedido:
-        config = pago_web.cargar_config()
         config["catalogos_subidos"] = True
-        pago_web.guardar_config(config)
+    pago_web.guardar_config(config)
+    foto["cortes_cerrados"] = sorted(r.get("cortes_cerrados") or [])
 
     sesion.pausar()
     avisos = []
     for c in r.get("conflictos", []):
-        texto = (f"{c.get('fecha_entrega')} {c.get('cod_camion')}: en el Excel se puso \"{c.get('valor_excel')}\" "
-                 f"en {c.get('campo')}, pero en la web ya estaba \"{c.get('valor_web')}\". Se dejó el de la web.")
+        if c.get("corte_cerrado"):
+            texto = (f"{c.get('fecha_entrega')} {c.get('cod_camion')}: el corte {c['corte_cerrado']} está cerrado; "
+                     f"el cambio del Excel en {c.get('campo')} (\"{c.get('valor_excel')}\") no se aplicó.")
+        else:
+            texto = (f"{c.get('fecha_entrega')} {c.get('cod_camion')}: en el Excel se puso \"{c.get('valor_excel')}\" "
+                     f"en {c.get('campo')}, pero en la web ya estaba \"{c.get('valor_web')}\". Se dejó el de la web.")
         avisos.append(texto)
         avisar(texto)
     for e in r.get("errores", []):
+        if e.get("tmp") in por_tmp:
+            rechazadas[e["tmp"]] = por_tmp[e["tmp"]][2]
         texto = f"No se pudo subir un dato del Excel ({e.get('campo') or e.get('tmp') or ''}): {e.get('error')}"
         avisos.append(texto)
         avisar(texto)
@@ -851,7 +1024,7 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     # IDs de las filas nuevas (escribir_fila los anota en la columna W).
     for tmp, ident in (r.get("ids") or {}).items():
         if tmp in por_tmp:
-            ubicacion[ident] = por_tmp[tmp]
+            ubicacion[ident] = por_tmp[tmp][:2]
 
     # 2) web -> Excel
     hechos = []
@@ -872,27 +1045,52 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
             fotos[o["id"]] = dict(escribir_fila(hoja, fila, o, hechos), _archivo=hoja.libro.ruta.name)
         else:
             sin_lugar.setdefault(o["fecha_entrega"], []).append(o)
+
+    def libro_del_corte(corte):
+        """El Excel del corte (abierto, o se abre, o se crea copiando el mas nuevo)."""
+        libro = next((l for l in libros if l.corte_id == corte["id"]), None)
+        if libro:
+            return libro
+        ruta = por_corte.get(corte["id"])
+        if ruta is None:
+            plantilla = por_corte[max(por_corte)] if por_corte else todos[0]
+            ruta = crear_archivo_corte(sesion, plantilla, corte, log)
+            por_corte[corte["id"]] = ruta
+        libro = Libro(ruta, sesion.abrir(ruta))
+        libros.append(libro)
+        return libro
+
     nuevas_hojas = 0
     for fecha_txt, filas in sorted(sin_lugar.items()):
         fecha = a_fecha(fecha_txt)
         if not fecha:
             continue
+        corte = corte_de(fecha)
+        if corte["id"] < primer_corte:
+            continue        # dias de cortes viejos: no se arman pestanas en esos archivos
+        libro = libro_del_corte(corte)
         nombre = nombre_hoja(fecha)
-        hoja = next((l.hojas[nombre] for l in libros if nombre in l.hojas), None)
+        hoja = libro.hojas.get(nombre)
         if hoja is None:
-            hoja = crear_hoja_dia(activo, fecha, len(filas))
+            hoja = crear_hoja_dia(libro, fecha, len(filas))
             nuevas_hojas += 1
-            log(f"Pago a transportes: pestaña {nombre} creada en el Excel ({len(filas)} camiones).")
+            log(f"Pago a transportes: pestaña {nombre} creada en {libro.ruta.name} ({len(filas)} camiones).")
         for o in filas:
             fila = hoja.fila_libre() or agregar_fila(hoja)
             fotos[o["id"]] = dict(escribir_fila(hoja, fila, o, hechos), _archivo=hoja.libro.ruta.name)
             ubicacion[o["id"]] = (hoja, fila)
-    # Filas con ID que la web ya no devuelve (otra base, o anteriores a "desde"): se dejan como estan.
+    # Filas con ID que la web ya no devuelve (anteriores a "desde"): se dejan como estan.
 
     for libro in libros:
         for hoja in libro.hojas.values():
             preparar_columna_id(hoja.ws)
-    escribir_catalogos(activo, r)
+    # TARIFA y transportistas solo en el Excel del corte actual (los cortes
+    # anteriores quedan con las tarifas con que se pagaron).
+    activo = next((l for l in libros if l.corte_id == actual["id"]), None)
+    if activo:
+        # Una sola tarifa por COD en el Excel: la que rige hoy (o desde el
+        # inicio del corte, si se programo un cambio para el corte nuevo).
+        escribir_catalogos(activo, r, max(hoy, actual["desde"]))
     sesion.reanudar()       # calculo automatico otra vez (recalcula antes de guardar)
     for libro in libros:
         if libro.modificado:
@@ -917,7 +1115,9 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
         partes.append(f"{pendientes} días sin enviar todavía")
     mensaje = ("Sincronizado: " + ", ".join(partes) + ".") if partes else "Sincronizado: sin cambios."
     log("Pago a transportes: " + mensaje)
-    return {"ok": True, "mensaje": mensaje, "avisos": avisos, "archivo": activo.ruta.name}
+    archivo = activo or (libros[0] if libros else None)
+    return {"ok": True, "mensaje": mensaje, "avisos": avisos, "archivo": archivo.ruta.name if archivo else "",
+            "corte": actual["nombre"]}
 
 
 if __name__ == "__main__":

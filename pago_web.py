@@ -192,7 +192,9 @@ def enviar_pendientes(log=None) -> int:
                 log(f"Pago a transportes: el día {fecha} quedó pendiente de enviar — {e}")
             continue
         _quitar_pendiente(datos)
-        if log:
+        if log and r.get("ignorado"):
+            log(f"Pago a transportes: el día {fecha} no se cargó — {r.get('aviso')}")
+        elif log:
             log(f"Pago a transportes: día {fecha} enviado ({r.get('nuevas', 0)} camiones nuevos, "
                 f"{r.get('actualizadas', 0)} actualizados).")
     return len(_pendientes())

@@ -36,7 +36,7 @@ import generar_rutas as gr
 import mymaps
 
 PUERTO = 5178
-VERSION = "2"
+VERSION = "3"
 ORIGENES_PERMITIDOS = {
     "https://coordinadorl.github.io",
     "http://localhost:8080",        # pruebas de la app en esta PC
@@ -892,6 +892,8 @@ class Generador(Controlador):
             estados_ubic = publicar(self.log, con_ruta=True, ubicaciones=cambios_ubic)
             self.overrides_llegaron(gr.overrides_locales(), True)
             gr.anotar_publicado(carpeta, nuevos, fechas)
+            if not MODO_PRUEBA:
+                gr.subir_pago(seleccion, fechas, self.log)
             fin = "Listo. Los choferes ya ven la ruta actualizada en el mapa."
             fin += self._actualizar_control(editables, estados_cambios, estados_ubic)
         else:
@@ -1679,11 +1681,95 @@ def elegir_archivo_windows(inicial):
 
 
 # ---------------------------------------------------------------------------
+# Pago a transportes: el Excel bimestral de esta PC <-> la web (pago_excel.py)
+# ---------------------------------------------------------------------------
+
+MINUTOS_SYNC_PAGO = 5
+
+
+class PagoTransportes(Controlador):
+    """Sincroniza solo cada 5 minutos (y cuando la pagina lo pide). Necesita
+    la clave de PC, que la pagina "Pago a transportes" entrega la primera vez
+    que se abre en esta PC con usuario coordinador o admin."""
+
+    def __init__(self):
+        super().__init__()
+        self.sincronizando = False
+        self.ultima = None          # {"hora", "ok", "mensaje", "archivo"}
+        self.avisos_sync = []       # conflictos (gano la web) de las ultimas sincronizaciones
+        if not MODO_PRUEBA:
+            threading.Thread(target=self._bucle, daemon=True).start()
+
+    def estado(self, _=None):
+        import pago_web
+        return dict(self.base_estado(), ok=True, prueba=MODO_PRUEBA, tiene_clave=pago_web.tiene_clave(),
+                    sincronizando=self.sincronizando, ultima=self.ultima, avisos_sync=list(self.avisos_sync),
+                    minutos=MINUTOS_SYNC_PAGO)
+
+    def guardar_clave(self, cuerpo):
+        import pago_web
+        try:
+            pago_web.guardar_clave(cuerpo.get("clave"))
+        except pago_web.ErrorPago as e:
+            return {"ok": False, "error": str(e)}
+        self.sincronizar_ahora()
+        return {"ok": True}
+
+    def sincronizar_ahora(self, _=None):
+        if not self.sincronizando:
+            threading.Thread(target=self._sincronizar, daemon=True).start()
+        return {"ok": True}
+
+    def limpiar_avisos(self, _=None):
+        self.avisos_sync = []
+        return {"ok": True}
+
+    def _sincronizar(self):
+        import pago_web
+        with self.lock:
+            if self.sincronizando:
+                return
+            self.sincronizando = True
+        try:
+            if MODO_PRUEBA:
+                self.ultima = {"hora": ahora(), "ok": True, "mensaje": "(modo prueba: el Excel no se sincroniza)"}
+                return
+            if not pago_web.tiene_clave():
+                return
+            import pago_excel
+            r = pago_excel.sincronizar(self.log)
+            self.ultima = {"hora": ahora(), "ok": bool(r.get("ok")), "mensaje": r.get("mensaje", ""),
+                           "archivo": r.get("archivo")}
+            if r.get("avisos"):
+                self.avisos_sync = (r["avisos"] + self.avisos_sync)[:30]
+        except pago_web.ErrorPago as e:
+            self.ultima = {"hora": ahora(), "ok": False, "mensaje": str(e)}
+            self.log("Pago a transportes: " + str(e))
+        except Exception:
+            detalle = traceback.format_exc()
+            gr.registrar_error("(pago a transportes)\n" + detalle)
+            self.ultima = {"hora": ahora(), "ok": False,
+                           "mensaje": "Falló inesperadamente: " + detalle.strip().splitlines()[-1]}
+        finally:
+            self.sincronizando = False
+
+    def _bucle(self):
+        time.sleep(60)              # que el servicio termine de arrancar
+        while True:
+            try:
+                self._sincronizar()
+            except Exception:
+                gr.registrar_error("(pago a transportes)\n" + traceback.format_exc())
+            time.sleep(MINUTOS_SYNC_PAGO * 60)
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
 GENERADOR = Generador()
 MYMAPS = MyMaps(GENERADOR)
+PAGO = PagoTransportes()
 # Coordinacion en los dos sentidos: My Maps no arranca el robot si Generar esta
 # trabajando, y Generar no reescribe los MAPA mientras el robot los usa.
 GENERADOR.otra_ocupada = lambda: MYMAPS.trabajando
@@ -1715,10 +1801,14 @@ RUTAS_POST = {
     "/mymaps/mensaje_dia": MYMAPS.mensaje_dia,
     "/mymaps/responder": MYMAPS.responder,
     "/mymaps/aviso_visto": MYMAPS.aviso_visto,
+    "/pago/clave": PAGO.guardar_clave,
+    "/pago/sincronizar": PAGO.sincronizar_ahora,
+    "/pago/limpiar_avisos": PAGO.limpiar_avisos,
 }
 RUTAS_GET = {
     "/generador/estado": GENERADOR.estado,
     "/mymaps/estado": MYMAPS.estado,
+    "/pago/estado": PAGO.estado,
 }
 
 

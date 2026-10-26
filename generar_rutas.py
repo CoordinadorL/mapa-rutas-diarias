@@ -80,6 +80,9 @@ CAMPOS_GRUPO = ["Fecha Liq", "Chofer", "Numero Liq", "vendedor", "CodigoCliente"
 # ... y suma estos (las columnas "Suma de ..." de los MAPA).
 CAMPOS_SUMA = ["Peso", "VentaNeta", "Total"]
 assert COLUMNAS_ESPERADAS == CAMPOS_GRUPO + ["Suma de " + c for c in CAMPOS_SUMA]
+# Se leen si estan (para contar las facturas de cada camion, que van a
+# "Pago a transportes"); una base sin estas columnas igual sirve para el mapa.
+CAMPOS_OPCIONALES = ["Numero", "Tipo"]
 
 DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 FECHAS_A_MOSTRAR = 6
@@ -200,19 +203,24 @@ def valor_celda(atributos: bytes, contenido, textos):
         return crudo
 
 
-def columnas_si_es_encabezado(celdas: dict, buscados: dict):
+def columnas_si_es_encabezado(celdas: dict, buscados: dict, opcionales=None):
     """Si la fila tiene todos los encabezados buscados, devuelve
-    {letra de columna: campo}; si no, None."""
+    {letra de columna: campo} (con los opcionales que esten); si no, None."""
     por_nombre = {normalizar(v): letra for letra, v in celdas.items() if isinstance(v, str)}
     if not all(n in por_nombre for n in buscados):
         return None
-    return {por_nombre[n]: campo for n, campo in buscados.items()}
+    columnas = {por_nombre[n]: campo for n, campo in buscados.items()}
+    for n, campo in (opcionales or {}).items():
+        if n in por_nombre:
+            columnas.setdefault(por_nombre[n], campo)
+    return columnas
 
 
-def filas_de_hoja(datos: bytes, textos, campos):
+def filas_de_hoja(datos: bytes, textos, campos, opcionales=()):
     """Filas (dict campo -> valor) de una hoja, buscando el encabezado en
     las primeras filas. None si la hoja no tiene esos encabezados."""
     buscados = {normalizar(c): c for c in campos}
+    opcionales = {normalizar(c): c for c in opcionales}
 
     # 1) Encontrar la fila de encabezados (y donde empiezan los datos).
     columnas = None
@@ -223,7 +231,7 @@ def filas_de_hoja(datos: bytes, textos, campos):
     for m in RE_CELDA.finditer(datos):
         if m.group(2) != fila_actual:
             if celdas:
-                columnas = columnas_si_es_encabezado(celdas, buscados)
+                columnas = columnas_si_es_encabezado(celdas, buscados, opcionales)
                 if columnas is not None:
                     inicio_datos = m.start()
                     break
@@ -235,7 +243,7 @@ def filas_de_hoja(datos: bytes, textos, campos):
         if m.group(4) is not None:
             celdas[m.group(1)] = valor_celda(m.group(3), m.group(4), textos)
     if columnas is None and celdas:
-        columnas = columnas_si_es_encabezado(celdas, buscados)
+        columnas = columnas_si_es_encabezado(celdas, buscados, opcionales)
     if columnas is None:
         return None
 
@@ -257,13 +265,14 @@ def filas_de_hoja(datos: bytes, textos, campos):
     return filas
 
 
-def filas_con_openpyxl(ruta: Path, nombre_hoja: str, campos):
+def filas_con_openpyxl(ruta: Path, nombre_hoja: str, campos, opcionales=()):
     """Camino lento de respaldo, por si el archivo no lo guardo Excel y la
     lectura rapida no reconoce su formato."""
     wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
     try:
         ws = wb[nombre_hoja]
         buscados = {normalizar(c): c for c in campos}
+        opcionales = {normalizar(c): c for c in opcionales}
         columnas = None
         filas = []
         for i, fila in enumerate(ws.iter_rows(values_only=True)):
@@ -271,7 +280,7 @@ def filas_con_openpyxl(ruta: Path, nombre_hoja: str, campos):
                 if i >= FILAS_PARA_ENCABEZADO:
                     return None
                 celdas = {j: v for j, v in enumerate(fila) if v is not None}
-                columnas = columnas_si_es_encabezado(celdas, buscados)
+                columnas = columnas_si_es_encabezado(celdas, buscados, opcionales)
                 continue
             filas.append({campo: fila[j] for j, campo in columnas.items() if j < len(fila)})
         return filas if columnas is not None else None
@@ -324,9 +333,9 @@ def leer_base(ruta: Path):
                     continue
                 if textos is None:
                     textos = textos_compartidos(z)
-                filas = filas_de_hoja(z.read(parte), textos, campos)
+                filas = filas_de_hoja(z.read(parte), textos, campos, CAMPOS_OPCIONALES)
                 if filas is None and normalizar(nombre) == principal:
-                    filas = filas_con_openpyxl(copia, nombre, campos)
+                    filas = filas_con_openpyxl(copia, nombre, campos, CAMPOS_OPCIONALES)
                 if filas is not None:
                     break
         if filas is None:
@@ -397,6 +406,7 @@ def agrupar(filas, fechas):
     solo de las fechas indicadas."""
     grupos = {}
     movidos = {}    # clave -> ruta de origen, para clientes pasados a otra ruta
+    facturas = {}   # clave -> numeros de factura (las notas de credito no cuentan)
     for fila in filas:
         if fila["Fecha Liq"] not in fechas:
             continue
@@ -410,6 +420,8 @@ def agrupar(filas, fechas):
                 sumas[i] += v
         if fila.get("_movido_de"):
             movidos[clave] = (fila["_movido_de"], fila.get("_cargue_destino"))
+        if fila.get("Numero") not in (None, "") and normalizar(fila.get("Tipo")).startswith("FACTURA"):
+            facturas.setdefault(clave, set()).add(texto(fila["Numero"]))
 
     camiones = {}
     # Los clientes que vienen de otra ruta van al final de la suya (asi no
@@ -422,6 +434,7 @@ def agrupar(filas, fechas):
             fila["_movido_de"], cargue = movidos[clave]
             if cargue:
                 fila["_cargue_destino"] = cargue
+        fila["_facturas"] = facturas.get(clave, set())
         chofer = texto(fila["Chofer"])
         cid = id_camion(chofer)
         camion = camiones.setdefault(cid, {"id": cid, "chofer": chofer, "filas": []})
@@ -439,6 +452,9 @@ def completar_camion(camion: dict) -> dict:
     propias = [f for f in camion["filas"] if not f.get("_movido_de")]
     camion["liquidaciones"] = sorted({f["Numero Liq"] for f in propias}, key=orden_valor)
     camion["movidos"] = sum(1 for f in camion["filas"] if f.get("_movido_de"))
+    # N de facturas distintas (columna L de Pago a transportes). Una base sin
+    # las columnas Numero/Tipo da 0.
+    camion["facturas"] = len(set().union(*(f.get("_facturas", ()) for f in camion["filas"])))
     return camion
 
 
@@ -2099,6 +2115,7 @@ def abrir_ventana():
                 # La carpeta de datos quedo igual a GitHub, con las ubicaciones aplicadas.
                 self.cola.put(("overrides", overrides_locales(), True))
                 anotar_publicado(carpeta, nuevos, fechas)
+                subir_pago(seleccion, fechas, log)
                 fin = "Listo. Los choferes ya ven la ruta actualizada en el mapa."
                 fin += self._actualizar_control(log, editables, estados_cambios, estados_ubic)
             else:
@@ -2293,6 +2310,17 @@ def abrir_ventana():
     raiz.report_callback_exception = error_de_ventana
     raiz.ventana_app = Ventana(raiz)        # (las pruebas la buscan aqui)
     raiz.mainloop()
+
+
+def subir_pago(seleccion, fechas, log=print) -> None:
+    """Manda el resumen del dia recien publicado a "Pago a transportes"
+    (pago_web.py). Va en segundo plano y nunca falla hacia afuera: la ruta
+    ya quedo publicada."""
+    try:
+        import pago_web
+        pago_web.subir_dia(seleccion, fechas, log)
+    except Exception:
+        registrar_error("(pago a transportes)\n" + traceback.format_exc())
 
 
 def registrar_error(detalle: str) -> None:

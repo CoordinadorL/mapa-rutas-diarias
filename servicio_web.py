@@ -36,7 +36,7 @@ import generar_rutas as gr
 import mymaps
 
 PUERTO = 5178
-VERSION = "4"
+VERSION = "5"
 ORIGENES_PERMITIDOS = {
     "https://coordinadorl.github.io",
     "http://localhost:8080",        # pruebas de la app en esta PC
@@ -1697,6 +1697,7 @@ class PagoTransportes(Controlador):
         self.sincronizando = False
         self.ultima = None          # {"hora", "ok", "mensaje", "archivo"}
         self.avisos_sync = []       # conflictos (gano la web) de las ultimas sincronizaciones
+        self.historico = {"leyendo": False, "error": "", "archivos": []}
         if not MODO_PRUEBA:
             threading.Thread(target=self._bucle, daemon=True).start()
 
@@ -1753,6 +1754,85 @@ class PagoTransportes(Controlador):
         finally:
             self.sincronizando = False
 
+    # -- Cortes anteriores a la web (pago_historico.py) --------------------
+    # La pagina pide revisar (lee los Excel viejos en segundo plano), muestra
+    # los totales de cada corte y pide importar uno por uno.
+
+    def historico_estado(self, _=None):
+        h = self.historico
+        return {"ok": True, "leyendo": h["leyendo"], "error": h["error"],
+                "archivos": [{k: v for k, v in a.items() if k != "_leido"} for a in h["archivos"]]}
+
+    def historico_revisar(self, _=None):
+        import pago_web
+        if not MODO_PRUEBA and not pago_web.tiene_clave():
+            return {"ok": False, "error": "Esta PC todavía no tiene la clave para hablar con la web."}
+        with self.lock:
+            if self.historico["leyendo"] or any(a["estado"] == "importando" for a in self.historico["archivos"]):
+                return self.historico_estado()
+            self.historico["leyendo"] = True
+            self.historico["error"] = ""
+        threading.Thread(target=self._historico_leer, daemon=True).start()
+        return self.historico_estado()
+
+    def _historico_leer(self):
+        import pago_historico
+        archivos = []
+        try:
+            carpeta = os.environ.get("PAGO_HISTORICO_CARPETA") if MODO_PRUEBA else None
+            for ruta in pago_historico.archivos_anteriores(carpeta):
+                try:
+                    x = pago_historico.leer_archivo(ruta)
+                    archivos.append({"archivo": x["archivo"], "corte_id": x["corte"]["id"], "corte": x["corte"]["nombre"],
+                                     "desde": x["corte"]["desde"], "hasta": x["corte"]["hasta"],
+                                     "totales": x["totales"], "avisos": x["avisos"], "cuadra": x["cuadra"],
+                                     "problema": x["problema"], "estado": "listo", "mensaje": "", "_leido": x})
+                except Exception as e:
+                    archivos.append({"archivo": ruta.name, "corte_id": pago_historico.corte_de_archivo(ruta), "corte": "",
+                                     "totales": None, "avisos": [], "cuadra": False,
+                                     "problema": f"No se pudo leer: {e}", "estado": "error", "mensaje": ""})
+            if not archivos:
+                self.historico["error"] = "No encontré Excel de cortes anteriores en la carpeta del pago."
+        except Exception as e:
+            gr.registrar_error("(pago historico)\n" + traceback.format_exc())
+            self.historico["error"] = f"No se pudieron leer los Excel: {e}"
+        finally:
+            self.historico["archivos"] = archivos
+            self.historico["leyendo"] = False
+
+    def historico_importar(self, cuerpo):
+        cid = str((cuerpo or {}).get("corte_id") or "")
+        with self.lock:
+            a = next((x for x in self.historico["archivos"] if x["corte_id"] == cid), None)
+            if not a or "_leido" not in a:
+                return {"ok": False, "error": "Ese corte no está en la lista: vuelve a revisar los archivos."}
+            if not a["cuadra"]:
+                return {"ok": False, "error": a["problema"]}
+            if a["estado"] == "importando":
+                return self.historico_estado()
+            a["estado"], a["mensaje"] = "importando", ""
+        threading.Thread(target=self._historico_subir, args=(a,), daemon=True).start()
+        return self.historico_estado()
+
+    def _historico_subir(self, a):
+        import pago_historico
+        import pago_web
+        try:
+            if MODO_PRUEBA:
+                time.sleep(2)
+                r = {"filas": a["totales"]["filas"], "reemplazadas": 0}
+            else:
+                r = pago_historico.importar(a["_leido"])
+            a["estado"] = "importado"
+            a["mensaje"] = f"{r.get('filas')} filas subidas" + (
+                f" (reemplazó {r['reemplazadas']} importadas antes)" if r.get("reemplazadas") else "") + "."
+            self.log(f"Pago a transportes: corte {a['corte']} importado de {a['archivo']} ({r.get('filas')} filas).")
+        except pago_web.ErrorPago as e:
+            a["estado"], a["mensaje"] = "error", str(e)
+        except Exception as e:
+            gr.registrar_error("(pago historico)\n" + traceback.format_exc())
+            a["estado"], a["mensaje"] = "error", f"Falló inesperadamente: {e}"
+
     def _bucle(self):
         time.sleep(60)              # que el servicio termine de arrancar
         while True:
@@ -1804,11 +1884,14 @@ RUTAS_POST = {
     "/pago/clave": PAGO.guardar_clave,
     "/pago/sincronizar": PAGO.sincronizar_ahora,
     "/pago/limpiar_avisos": PAGO.limpiar_avisos,
+    "/pago/historico/revisar": PAGO.historico_revisar,
+    "/pago/historico/importar": PAGO.historico_importar,
 }
 RUTAS_GET = {
     "/generador/estado": GENERADOR.estado,
     "/mymaps/estado": MYMAPS.estado,
     "/pago/estado": PAGO.estado,
+    "/pago/historico": PAGO.historico_estado,
 }
 
 

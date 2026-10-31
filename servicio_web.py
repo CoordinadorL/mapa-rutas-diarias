@@ -36,7 +36,7 @@ import generar_rutas as gr
 import mymaps
 
 PUERTO = 5178
-VERSION = "5"
+VERSION = "6"
 ORIGENES_PERMITIDOS = {
     "https://coordinadorl.github.io",
     "http://localhost:8080",        # pruebas de la app en esta PC
@@ -1413,6 +1413,11 @@ class MyMaps(Controlador):
         threading.Thread(target=hilo, daemon=True).start()
 
     def _subir(self, log, carpeta, entrega, reemplazar):
+        # El dia de entrega elegido tambien vale para el pago a transportes.
+        liq = mymaps.fecha_de_carpeta(Path(carpeta))
+        if liq and not MODO_PRUEBA:
+            import pago_web
+            pago_web.mover_entrega(liq, entrega, log)
         creados = robot("subir", carpeta, entrega, log, self.cancelar, reemplazar=reemplazar)
         self._terminar()
         with self.lock:

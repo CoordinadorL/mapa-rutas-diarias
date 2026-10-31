@@ -47,8 +47,9 @@ PATRON_ARCHIVO = "CAMIONES-AYUDANTES-FRECUENCIAS - *.xlsx"
 
 PREFIJOS_DIA = ["LNS", "MTS", "MCL", "JVS", "VNS", "SBD", "DMG"]
 # Pestanas de dia: LNS28-09, MTS29-09... (en archivos viejos tambien "MCLS23-09"
-# o "MRLS 26-08"): 2 a 4 letras, dia y mes.
-RE_HOJA_DIA = re.compile(r"^([A-Z]{2,4})\s*(\d{2})-(\d{2})$")
+# o "MRLS 26-08", y a mano "SABADO31-10"): letras, dia y mes. Se compara con
+# el nombre normalizado (sin tildes): "SÁBADO 31-10" tambien vale.
+RE_HOJA_DIA = re.compile(r"^([A-Z]{2,10})\s*(\d{2})-(\d{2})$")
 MESES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE",
          "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
 HOJA_PLANTILLA = "BASE"
@@ -421,7 +422,7 @@ class Libro:
         self.modificado = False
         for i in range(1, wb.Worksheets.Count + 1):
             ws = wb.Worksheets(i)
-            if RE_HOJA_DIA.match(ws.Name.strip()):
+            if RE_HOJA_DIA.match(normalizar(ws.Name)):
                 self.hojas[ws.Name.strip()] = HojaDia(self, ws)
 
     def hoja(self, nombre):
@@ -464,7 +465,7 @@ class HojaDia:
         self.fecha = self._fecha()
 
     def _fecha(self):
-        m = RE_HOJA_DIA.match(self.nombre)
+        m = RE_HOJA_DIA.match(normalizar(self.nombre))
         dia, mes = int(m.group(2)), int(m.group(3))
         for f in self.filas.values():
             d = a_fecha(f["datos"]["fecha_entrega"])
@@ -938,6 +939,7 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     # 1) Excel -> web
     ubicacion = {}          # id -> (HojaDia, fila)
     cambios, nuevas, por_tmp, vistas = [], [], {}, set()
+    restaurar = []          # filas con ID que la foto no conoce (ver _pagoSync)
     for libro in libros:
         for hoja in libro.hojas.values():
             for fila, f in hoja.filas.items():
@@ -949,6 +951,11 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
                             if not iguales(valor, antes.get(campo, "")):
                                 cambios.append({"id": f["id"], "campo": campo, "valor": valor,
                                                 "base": antes.get(campo, "")})
+                    elif f["con_datos"]:
+                        datos = dict(f["datos"])
+                        if not datos.get("fecha_entrega") and hoja.fecha:
+                            datos["fecha_entrega"] = hoja.fecha.isoformat()
+                        restaurar.append({"id": f["id"], "datos": datos})
                 elif f["con_datos"] and (libro.corte_id or "") >= primer_corte:
                     tmp = f"XLS|{hoja.nombre}|{fila}"
                     datos = dict(f["datos"])
@@ -965,17 +972,34 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     for tmp in list(rechazadas):
         if tmp not in vistas:
             del rechazadas[tmp]
-    # Filas que estaban en el Excel y ya no estan: las borraron a mano.
+    # Filas que estaban en el Excel y ya no estan: las borraron a mano. Pero
+    # si falta el DIA entero (la pestana se borro o se renombro con un nombre
+    # que no se reconoce), no se borra nada en la web: se avisa.
     eliminar = []
+    dias_con_filas = {f["datos"].get("fecha_entrega") or (h.fecha.isoformat() if h.fecha else "")
+                      for l in libros for h in l.hojas.values() for f in h.filas.values() if f["id"]}
+    faltan_dias, sin_pestana = {}, set()
     for ident, antes in fotos.items():
         if ident in ubicacion:
             continue
         if any(l.ruta.name == antes.get("_archivo") for l in libros):
+            dia = antes.get("fecha_entrega") or ""
+            if dia and dia not in dias_con_filas:
+                faltan_dias[dia] = faltan_dias.get(dia, 0) + 1
+                sin_pestana.add(ident)
+                continue
             eliminar.append({"id": ident, "base": {k: v for k, v in antes.items() if not k.startswith("_")}})
+    avisados = foto.setdefault("dias_faltantes", [])
+    for dia, n in sorted(faltan_dias.items()):
+        if dia not in avisados:
+            avisar(f"En el Excel ya no está la pestaña del {dia[8:10]}/{dia[5:7]} ({n} filas): no se borró nada en "
+                   f"la web. Si la renombraste, el nombre tiene que terminar en el día y mes (ej. SBD31-10); si de "
+                   f"verdad hay que quitar ese día, quítalo desde la web.")
+    foto["dias_faltantes"] = sorted(faltan_dias)
 
     fechas = [h.fecha for l in libros for h in l.hojas.values() if h.fecha]
     desde = min(fechas + [anterior["desde"]]).isoformat()
-    pedido = {"cambios": cambios, "nuevas": nuevas, "eliminar": eliminar, "desde": desde}
+    pedido = {"cambios": cambios, "nuevas": nuevas, "eliminar": eliminar, "restaurar": restaurar, "desde": desde}
     if not config.get("catalogos_subidos") and libros:
         pedido["catalogos_excel"] = catalogos_del_excel(libros[0])
     if cambios or nuevas or eliminar:
@@ -1018,7 +1042,16 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     eliminadas = [o for o in filas_web if o.get("eliminado") == "SI"]
     vivas = [o for o in filas_web if o.get("eliminado") != "SI"]
     limpiadas = 0
+    # Una fila que se pidio restaurar solo se limpia si la web dice que la
+    # borro alguien en la web (un backend viejo no responde no_restauradas:
+    # entonces no se toca).
+    pedidas = {x["id"] for x in restaurar}
+    no_restauradas = set(r.get("no_restauradas") or [])
+    if r.get("restauradas"):
+        log(f"Pago a transportes: {len(r['restauradas'])} filas del Excel volvieron a la web.")
     for o in eliminadas:
+        if o["id"] in pedidas and o["id"] not in no_restauradas:
+            continue
         if o["id"] in ubicacion:
             hoja, fila = ubicacion.pop(o["id"])
             limpiar_fila(hoja, fila)
@@ -1028,7 +1061,18 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     for o in vivas:
         if o["id"] in ubicacion:
             hoja, fila = ubicacion[o["id"]]
+            # La fecha se cambio en la web (ej. My Maps con otro dia de
+            # entrega): la fila pasa a la pestana de su dia nuevo.
+            nueva = a_fecha(o.get("fecha_entrega"))
+            en_excel = a_fecha(hoja.filas[fila]["datos"].get("fecha_entrega"))
+            if nueva and hoja.fecha and nueva != hoja.fecha and en_excel == hoja.fecha:
+                limpiar_fila(hoja, fila)
+                del ubicacion[o["id"]]
+                sin_lugar.setdefault(o["fecha_entrega"], []).append(o)
+                continue
             fotos[o["id"]] = dict(escribir_fila(hoja, fila, o, hechos), _archivo=hoja.libro.ruta.name)
+        elif o["id"] in sin_pestana:
+            continue    # su pestana no se reconoce (ver arriba): no se duplica en otra
         else:
             sin_lugar.setdefault(o["fecha_entrega"], []).append(o)
 
@@ -1056,7 +1100,8 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
             continue        # dias de cortes viejos: no se arman pestanas en esos archivos
         libro = libro_del_corte(corte)
         nombre = nombre_hoja(fecha)
-        hoja = libro.hojas.get(nombre)
+        # La pestana de ese dia, aunque tenga otro nombre (ej. SABADO31-10).
+        hoja = libro.hojas.get(nombre) or next((h for h in libro.hojas.values() if h.fecha == fecha), None)
         if hoja is None:
             hoja = crear_hoja_dia(libro, fecha, len(filas))
             nuevas_hojas += 1

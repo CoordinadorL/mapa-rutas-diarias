@@ -200,6 +200,32 @@ def enviar_pendientes(log=None) -> int:
     return len(_pendientes())
 
 
+def mover_entrega(fecha_liq: date, entrega: date, log=None) -> None:
+    """En My Maps se eligio otro dia de entrega que el automatico (feriado,
+    se adelanto...): los camiones de esa liquidacion pasan a ese dia en el
+    pago. En segundo plano; nunca lanza."""
+    auto = entrega_de(fecha_liq)
+    if entrega == auto:
+        return
+
+    def mover():
+        try:
+            enviar_pendientes(log)          # el dia tiene que estar en la web antes
+            r = llamar("pago_mover_entrega", {"fecha_liq": fecha_liq.isoformat(), "desde": auto.isoformat(),
+                                              "fecha_entrega": entrega.isoformat()})
+            if log and r.get("aviso"):
+                log(f"Pago a transportes: la entrega no se cambió — {r['aviso']}")
+            elif log and r.get("movidas"):
+                log(f"Pago a transportes: {r['movidas']} camiones de la liquidación del {fecha_liq:%d/%m} "
+                    f"pasan a la entrega del {entrega:%d/%m}.")
+        except Exception as e:
+            if log:
+                log(f"Pago a transportes: no se pudo pasar la entrega al {entrega:%d/%m} ({e}). "
+                    "Cámbiala en la web (columna FECHA).")
+
+    threading.Thread(target=mover, daemon=True).start()
+
+
 def subir_dia(seleccion, fechas, log=None) -> None:
     """Anota el dia como pendiente (al instante) y lo manda en segundo plano:
     si el envio no llega (sin internet, se cerro la ventana), la siguiente

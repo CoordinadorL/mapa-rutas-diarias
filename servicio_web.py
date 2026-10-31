@@ -36,7 +36,7 @@ import generar_rutas as gr
 import mymaps
 
 PUERTO = 5178
-VERSION = "6"
+VERSION = "7"
 ORIGENES_PERMITIDOS = {
     "https://coordinadorl.github.io",
     "http://localhost:8080",        # pruebas de la app en esta PC
@@ -1131,6 +1131,35 @@ class MyMaps(Controlador):
         self.carpetas_texto = []
         self._links = []
         self._links_mtime = None
+        self._links_publicados = None   # lo ultimo que se mando a la web
+        if not MODO_PRUEBA:
+            threading.Thread(target=self._bucle_links, daemon=True).start()
+
+    # Los links tambien se publican en la web (MyMapsLinks.gs) para verlos
+    # desde cualquier equipo (usuarios supervisor, otras PCs, el telefono).
+    # Se revisa cada 2 minutos; solo se manda si la lista cambio.
+    def _bucle_links(self):
+        time.sleep(30)              # que el servicio termine de arrancar
+        while True:
+            try:
+                self.publicar_links()
+            except Exception:
+                gr.registrar_error("(links de My Maps)\n" + traceback.format_exc())
+            time.sleep(120)
+
+    def publicar_links(self):
+        import pago_web
+        if not pago_web.tiene_clave():
+            return
+        links = self.links()
+        firma = json.dumps(links, sort_keys=True, ensure_ascii=False)
+        if firma == self._links_publicados:
+            return
+        try:
+            pago_web.llamar("mymaps_links", {"dias": links}, timeout=60)
+            self._links_publicados = firma
+        except pago_web.ErrorPago:
+            pass                    # sin internet o backend viejo: se reintenta en la proxima vuelta
 
     def otra_ocupada(self):
         return bool(self.motivo_otra_ocupada())
@@ -1563,6 +1592,7 @@ class MyMaps(Controlador):
                     continue
                 vistos.add(m["mid"])
                 mapas.append({"mid": m["mid"], "titulo": m["titulo"], "url": m["url"],
+                              "descripcion": m.get("descripcion", ""),
                               "transportistas": "-".join(m.get("transportistas", []))
                               or ("(hecho a mano)" if m.get("origen") == "manual" else "")})
             salida.append({"dia": dia, "texto": mymaps.fecha_larga(date.fromisoformat(dia)), "mapas": mapas})

@@ -26,7 +26,9 @@ nombre, % de retorno, pago, valor a cancelar) quedan con sus formulas.
 Prueba sobre una copia:  python pago_excel.py --carpeta <carpeta con la copia>
 """
 import json
+import hashlib
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -76,6 +78,23 @@ FORMULA_S = ('=IF(C{f}=0,0,IF(OR(P{f}<=3%,R{f}="SI"),G{f},'
              'IF(OR(C{f}=1,C{f}=2),IFERROR(VLOOKUP(E{f},TARIFA!A:J,4,0),0),IFERROR(VLOOKUP(E{f},TARIFA!A:J,9,0),0))))')
 
 _BLOQUEO = threading.Lock()
+# Los Excel son documentos de OneDrive con Autoguardado: al cerrar, Excel
+# termina de subirlos ("Cerrando ..."). Se le da tiempo de sobra antes de
+# cerrarlo a la fuerza.
+SEGUNDOS_CIERRE = 300
+
+
+def _matar_proceso(pid, sesion=None):
+    """Cierra el Excel escondido de la sincronizacion (solo ese PID)."""
+    if sesion is not None:
+        sesion.cierre_forzado = True
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=30,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
 EXCEL_OCUPADO = ("Excel está ocupado (¿hay una celda en edición o un cuadro abierto?). "
                  "Se reintenta en la próxima sincronización.")
 # Datos que trae la ruta publicada: si una fila escrita a mano se empareja
@@ -384,16 +403,29 @@ class SesionExcel:
 
     def cerrar(self):
         self.reanudar()
-        for _, wb in self.propios:
-            try:
-                wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if self.app is not None:
-            try:
-                self.app.Quit()
-            except Exception:
-                pass
+        # Un libro de OneDrive puede quedar colgado al cerrarse ("Cerrando ...",
+        # esperando a OneDrive) y el Close no vuelve nunca: paso el 09-11 y
+        # trababa la sincronizacion. Si tarda mas de SEGUNDOS_CIERRE se cierra
+        # ESTE Excel escondido (ya guardo todo antes de cerrar).
+        vigilante = None
+        if self.app is not None and getattr(self, "pid", None):
+            vigilante = threading.Timer(SEGUNDOS_CIERRE, _matar_proceso, args=(self.pid, self))
+            vigilante.daemon = True
+            vigilante.start()
+        try:
+            for _, wb in self.propios:
+                try:
+                    wb.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            if self.app is not None:
+                try:
+                    self.app.Quit()
+                except Exception:
+                    pass
+        finally:
+            if vigilante:
+                vigilante.cancel()
         self.propios, self.app, self.apps, self.abiertos = [], None, [], {}
         self._esperar_que_termine()
 
@@ -928,6 +960,77 @@ def emparejar_con_web(nuevas, filas_web, ocupadas):
     return pendientes, vinculos
 
 
+def firma_archivo(ruta: Path):
+    try:
+        st = Path(ruta).stat()
+        return [st.st_mtime_ns, st.st_size]
+    except OSError:
+        return None
+
+
+def firma_catalogos(r: dict) -> str:
+    datos = json.dumps([r.get("tarifas"), r.get("transportistas"), r.get("lineas")], sort_keys=True, default=str)
+    return hashlib.md5(datos.encode("utf-8")).hexdigest()
+
+
+def abierto_en_excel_usuario(ruta: Path) -> bool:
+    """El libro esta abierto en el Excel del usuario (puede tener cambios sin
+    guardar que el archivo en disco todavia no tiene). Si Excel no responde,
+    se toma como abierto (el camino completo avisara que esta ocupado)."""
+    import pythoncom
+    import win32com.client as w
+    try:
+        app = w.GetActiveObject("Excel.Application")
+    except pythoncom.com_error:
+        return False
+    try:
+        for i in range(1, app.Workbooks.Count + 1):
+            local = ruta_local_de(app.Workbooks(i).FullName)
+            if local is not None and misma_ruta(local, ruta):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def nada_que_hacer(abrir, foto: dict, primer_corte: str) -> bool:
+    """True si desde la ultima sincronizacion completa no cambio nada: los
+    Excel en disco estan igual (y no estan abiertos con cambios sin guardar)
+    y la web devuelve exactamente lo que se escribio en ellos. Asi la vuelta
+    de cada 5 minutos casi nunca abre Excel (abrir y cerrar los libros de
+    OneDrive en un Excel escondido a veces se cuelga esperando a OneDrive)."""
+    firmas = foto.get("archivos") or {}
+    desde = foto.get("desde")
+    if not desde or any(firmas.get(a.name) != firma_archivo(a) for a in abrir):
+        return False
+    if any(abierto_en_excel_usuario(a) for a in abrir):
+        return False
+    r = pago_web.llamar("pago_sync", {"cambios": [], "nuevas": [], "eliminar": [], "restaurar": [], "desde": desde},
+                        timeout=180)
+    if firma_catalogos(r) != foto.get("catalogos_firma"):
+        return False
+    if sorted(r.get("cortes_cerrados") or []) != sorted(foto.get("cortes_cerrados") or []):
+        return False
+    fotos = foto.get("filas") or {}
+    vistas = set()
+    for o in r.get("filas", []):
+        antes = fotos.get(o["id"])
+        if o.get("eliminado") == "SI":
+            if antes is not None:
+                return False
+            continue
+        fecha = a_fecha(o.get("fecha_entrega"))
+        if antes is None:
+            if fecha and corte_de(fecha)["id"] < primer_corte:
+                continue        # dias de cortes viejos: el camino completo tampoco los escribe
+            return False
+        if any(not iguales(norm(campo, o.get(campo)), antes.get(campo, "")) for campo in COLUMNAS.values()):
+            return False
+        vistas.add(o["id"])
+    # Una fila escrita en el Excel que la web ya no devuelve: algo cambio.
+    return not any(i not in vistas and str(a.get("fecha_entrega") or "") >= desde for i, a in fotos.items())
+
+
 def cargar_foto() -> dict:
     try:
         return json.loads(ARCHIVO_FOTO.read_text(encoding="utf-8"))
@@ -951,6 +1054,14 @@ def sincronizar(log=print, carpeta=None) -> dict:
     pythoncom.CoInitialize()
     # Con --carpeta (pruebas sobre una copia) nunca se usa el Excel abierto del usuario.
     sesion = SesionExcel(usar_excel_abierto=carpeta is None)
+    # Si el Excel escondido hay que cerrarlo a la fuerza (colgado subiendo a
+    # OneDrive), lo que se escribio en esta vuelta puede no haber llegado al
+    # archivo: se vuelve a la foto de antes y la proxima vuelta lo reescribe
+    # (si si llego, la proxima vuelta solo lo confirma, sin duplicar).
+    try:
+        foto_antes = ARCHIVO_FOTO.read_text(encoding="utf-8")
+    except OSError:
+        foto_antes = None
     try:
         return _sincronizar(sesion, log, carpeta)
     except pythoncom.com_error as e:
@@ -966,6 +1077,16 @@ def sincronizar(log=print, carpeta=None) -> dict:
         except Exception:
             pago_web.registrar_error("(cerrar Excel al sincronizar)\n" + traceback.format_exc())
         finally:
+            if getattr(sesion, "cierre_forzado", False):
+                avisar("El Excel escondido se colgó al cerrar (subiendo a OneDrive) y se cerró a la fuerza: "
+                       "la próxima sincronización vuelve a revisar todo.")
+                try:
+                    if foto_antes is not None:
+                        ARCHIVO_FOTO.write_text(foto_antes, encoding="utf-8")
+                    else:
+                        ARCHIVO_FOTO.unlink()
+                except OSError:
+                    pass
             try:
                 pythoncom.CoUninitialize()
             except Exception:
@@ -994,13 +1115,43 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
         if cid and cid not in por_corte:
             por_corte[cid] = a
     # Se abren el Excel del corte actual y el del anterior (devoluciones que
-    # llegan despues del 25), y los que ya tienen filas sincronizadas.
+    # llegan despues del 25), y los que ya tienen filas sincronizadas. El de
+    # un corte CERRADO no: ahi ya no puede cambiar nada (ni en la web ni en el Excel).
+    cerrados = set(foto.get("cortes_cerrados") or [])
     con_filas = {f.get("_archivo") for f in fotos.values()}
-    abrir = [por_corte[c["id"]] for c in (actual, anterior) if c["id"] in por_corte and c["id"] >= primer_corte]
-    abrir += [a for a in todos if a.name in con_filas and a not in abrir]
+    abrir = [por_corte[c["id"]] for c in (actual, anterior)
+             if c["id"] in por_corte and c["id"] >= primer_corte and c["id"] not in cerrados]
+    abrir += [a for a in todos if a.name in con_filas and a not in abrir and corte_de_archivo(a) not in cerrados]
     pendientes = pago_web.enviar_pendientes(log)
+    if abrir and nada_que_hacer(abrir, foto, primer_corte):
+        mensaje = (f"Sincronizado: sin cambios ({pendientes} días sin enviar todavía)." if pendientes
+                   else "Sincronizado: sin cambios.")
+        log("Pago a transportes: " + mensaje)
+        archivo = por_corte.get(actual["id"]) if por_corte.get(actual["id"]) in abrir else abrir[0]
+        return {"ok": True, "mensaje": mensaje, "avisos": [], "archivo": archivo.name, "corte": actual["nombre"]}
     libros = [Libro(r, sesion.abrir(r)) for r in abrir]
     rechazadas = foto.setdefault("rechazadas", {})
+
+    # Una fila copiada y pegada (con su columna W oculta) repite el ID de otra
+    # (paso el 09-11: F227 agregado copiando la fila del FO60). El ID se queda
+    # con la fila que coincide con lo sincronizado; las otras pasan a ser
+    # filas nuevas (si no, sus datos pisaban la otra fila en la web).
+    avisos_previos = []
+    ocurrencias = {}
+    for libro in libros:
+        for hoja in libro.hojas.values():
+            for fila, f in hoja.filas.items():
+                if f["id"]:
+                    ocurrencias.setdefault(f["id"], []).append((hoja, fila, f))
+    for ident, lugares in ocurrencias.items():
+        if len(lugares) < 2:
+            continue
+        antes = fotos.get(ident) or {}
+        lugares.sort(key=lambda x: sum(1 for c, v in x[2]["datos"].items() if not iguales(v, antes.get(c, ""))))
+        for hoja, fila, f in lugares[1:]:
+            f["id"] = ""
+            avisos_previos.append(f"{hoja.nombre} fila {fila} ({f['datos'].get('cod_camion') or 'sin camión'}): tenía el ID "
+                                  f"de otra fila (se copió y pegó con la columna oculta W); se subió como fila nueva.")
 
     # 1) Excel -> web
     ubicacion = {}          # id -> (HojaDia, fila)
@@ -1064,7 +1215,7 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     foto["dias_faltantes"] = sorted(faltan_dias)
 
     fechas = [h.fecha for l in libros for h in l.hojas.values() if h.fecha]
-    desde = min(fechas + [anterior["desde"]]).isoformat()
+    desde = min(fechas + [actual["desde"] if anterior["id"] in cerrados else anterior["desde"]]).isoformat()
     # Las filas nuevas del Excel van en un segundo paso: antes se buscan en lo
     # que ya tiene la web (ver emparejar_con_web).
     pedido = {"cambios": cambios, "nuevas": [], "eliminar": eliminar, "restaurar": restaurar, "desde": desde}
@@ -1118,7 +1269,7 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
 
     sesion.pausar()
     avisos = []
-    for texto in avisos_vinculo:
+    for texto in avisos_previos + avisos_vinculo:
         avisos.append(texto)
         avisar(texto)
     for c in r.get("conflictos", []):
@@ -1235,6 +1386,11 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     for libro in libros:
         if libro.modificado:
             sesion.guardar(libro.wb)
+    # Como quedaron los archivos y la web: si en la proxima vuelta nada de
+    # esto cambio, no hace falta abrir Excel (ver nada_que_hacer).
+    foto["archivos"] = {l.ruta.name: firma_archivo(l.ruta) for l in libros}
+    foto["desde"] = desde
+    foto["catalogos_firma"] = firma_catalogos(r)
     guardar_foto(foto)
 
     partes = []

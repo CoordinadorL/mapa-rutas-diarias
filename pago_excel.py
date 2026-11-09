@@ -76,6 +76,11 @@ FORMULA_S = ('=IF(C{f}=0,0,IF(OR(P{f}<=3%,R{f}="SI"),G{f},'
              'IF(OR(C{f}=1,C{f}=2),IFERROR(VLOOKUP(E{f},TARIFA!A:J,4,0),0),IFERROR(VLOOKUP(E{f},TARIFA!A:J,9,0),0))))')
 
 _BLOQUEO = threading.Lock()
+EXCEL_OCUPADO = ("Excel está ocupado (¿hay una celda en edición o un cuadro abierto?). "
+                 "Se reintenta en la próxima sincronización.")
+# Datos que trae la ruta publicada: si una fila escrita a mano se empareja
+# con la de la web y difieren, queda el de la web (y se avisa).
+CAMPOS_DE_LA_CARGA = ("kgs", "facturas", "monto")
 
 
 def col_num(letra: str) -> int:
@@ -311,7 +316,13 @@ class SesionExcel:
             except pythoncom.com_error:
                 app_usuario = None
             if app_usuario is not None:
-                for i in range(1, app_usuario.Workbooks.Count + 1):
+                try:
+                    abiertos = app_usuario.Workbooks.Count
+                except (AttributeError, pythoncom.com_error):
+                    # El Excel del usuario esta ocupado (abriendo, con una
+                    # celda en edicion o un cuadro abierto): se intenta luego.
+                    raise ErrorPago(EXCEL_OCUPADO)
+                for i in range(1, abiertos + 1):
                     wb = app_usuario.Workbooks(i)
                     local = ruta_local_de(wb.FullName)
                     if local is None or not misma_ruta(local, ruta):
@@ -407,7 +418,10 @@ class SesionExcel:
             return
         try:
             if win32event.WaitForSingleObject(proceso, 15000) == win32event.WAIT_TIMEOUT:
-                win32api.TerminateProcess(proceso, 1)
+                try:
+                    win32api.TerminateProcess(proceso, 1)
+                except Exception:
+                    pass    # ya se estaba cerrando ("Acceso denegado"): no es un error
         finally:
             win32api.CloseHandle(proceso)
 
@@ -871,6 +885,49 @@ def catalogos_del_excel(libro: Libro) -> dict:
 # Sincronizacion
 # ---------------------------------------------------------------------------
 
+def emparejar_con_web(nuevas, filas_web, ocupadas):
+    """Filas escritas a mano en el Excel (sin ID) que ya estan en la web --por
+    ejemplo un dia cargado a mano mientras la sincronizacion no corria-- se
+    enlazan con su fila de la web en vez de subirse como nuevas (si no, el
+    dia queda duplicado en la web y en el Excel). Dentro del mismo dia, por
+    codigo + kilos + $; si no, codigo + $ (un kilo mal tipeado); si no,
+    kilos + $ cuando hay una sola fila asi (codigo cambiado a mano).
+    Devuelve (las que siguen siendo nuevas, [(nueva, fila_web)])."""
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def cerca(a, b):
+        return abs(num(a) - num(b)) <= 0.05
+
+    def mismo_codigo(n, o):
+        return str(o.get("cod_camion") or "").strip().upper() == str(n.get("cod_camion") or "").strip().upper()
+
+    reglas = [
+        (lambda n, o: mismo_codigo(n, o) and cerca(n.get("kgs"), o.get("kgs")) and cerca(n.get("monto"), o.get("monto")), False),
+        (lambda n, o: mismo_codigo(n, o) and num(n.get("monto")) > 0 and cerca(n.get("monto"), o.get("monto")), False),
+        (lambda n, o: num(n.get("monto")) > 0 and cerca(n.get("kgs"), o.get("kgs")) and cerca(n.get("monto"), o.get("monto")), True),
+    ]
+    por_dia = {}
+    for o in filas_web:
+        if o.get("eliminado") != "SI" and o["id"] not in ocupadas:
+            por_dia.setdefault(str(o.get("fecha_entrega")), []).append(o)
+    usadas, vinculos, pendientes = set(), [], list(nuevas)
+    for regla, unica in reglas:
+        siguen = []
+        for n in pendientes:
+            candidatas = [o for o in por_dia.get(str(n.get("fecha_entrega")), []) if o["id"] not in usadas and regla(n, o)]
+            if candidatas and (not unica or len(candidatas) == 1):
+                usadas.add(candidatas[0]["id"])
+                vinculos.append((n, candidatas[0]))
+            else:
+                siguen.append(n)
+        pendientes = siguen
+    return pendientes, vinculos
+
+
 def cargar_foto() -> dict:
     try:
         return json.loads(ARCHIVO_FOTO.read_text(encoding="utf-8"))
@@ -898,13 +955,22 @@ def sincronizar(log=print, carpeta=None) -> dict:
         return _sincronizar(sesion, log, carpeta)
     except pythoncom.com_error as e:
         if _es_excel_ocupado(e):
-            raise ErrorPago("Excel está ocupado (¿hay una celda en edición o un cuadro abierto?). "
-                            "Se reintenta en la próxima sincronización.")
+            raise ErrorPago(EXCEL_OCUPADO)
         raise
     finally:
-        sesion.cerrar()
-        pythoncom.CoUninitialize()
-        _BLOQUEO.release()
+        # El candado se suelta SIEMPRE: el 05-11 un error al cerrar el Excel
+        # escondido lo dejo tomado y ninguna sincronizacion volvio a correr
+        # hasta reiniciar el servicio.
+        try:
+            sesion.cerrar()
+        except Exception:
+            pago_web.registrar_error("(cerrar Excel al sincronizar)\n" + traceback.format_exc())
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+            _BLOQUEO.release()
 
 
 def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
@@ -999,13 +1065,50 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
 
     fechas = [h.fecha for l in libros for h in l.hojas.values() if h.fecha]
     desde = min(fechas + [anterior["desde"]]).isoformat()
-    pedido = {"cambios": cambios, "nuevas": nuevas, "eliminar": eliminar, "restaurar": restaurar, "desde": desde}
+    # Las filas nuevas del Excel van en un segundo paso: antes se buscan en lo
+    # que ya tiene la web (ver emparejar_con_web).
+    pedido = {"cambios": cambios, "nuevas": [], "eliminar": eliminar, "restaurar": restaurar, "desde": desde}
     if not config.get("catalogos_subidos") and libros:
         pedido["catalogos_excel"] = catalogos_del_excel(libros[0])
-    if cambios or nuevas or eliminar:
-        log(f"Pago a transportes: subiendo del Excel {len(cambios)} cambios, {len(nuevas)} filas nuevas"
+    if cambios or eliminar:
+        log(f"Pago a transportes: subiendo del Excel {len(cambios)} cambios"
             + (f", {len(eliminar)} borradas" if eliminar else "") + "...")
     r = pago_web.llamar("pago_sync", pedido, timeout=180)
+    vinculos, avisos_vinculo = [], []
+    if nuevas:
+        nuevas, vinculos = emparejar_con_web(nuevas, r.get("filas", []), set(ubicacion) | sin_pestana)
+        cambios2 = []
+        for n, o in vinculos:
+            ubicacion[o["id"]] = por_tmp[n["tmp"]][:2]
+            for campo in COLUMNAS.values():
+                if campo == "fecha_entrega":
+                    continue
+                en_excel, en_web = n.get(campo, ""), norm(campo, o.get(campo))
+                if iguales(en_excel, en_web):
+                    continue
+                if campo in CAMPOS_DE_LA_CARGA:
+                    if en_excel != "":
+                        avisos_vinculo.append(f"{o.get('fecha_entrega')} {o.get('cod_camion')}: en el Excel {campo} = "
+                                              f"{en_excel}, en la ruta publicada {en_web}. Se dejó el de la ruta publicada.")
+                    continue
+                if en_excel == "":
+                    continue        # lo que el Excel no tiene, queda como esta en la web
+                cambios2.append({"id": o["id"], "campo": campo, "valor": en_excel,
+                                 "base": "" if o.get(campo) is None else o.get(campo)})
+        if vinculos:
+            log(f"Pago a transportes: {len(vinculos)} filas escritas a mano en el Excel ya estaban en la web: "
+                f"se enlazaron (sin duplicar).")
+        if nuevas or cambios2:
+            log(f"Pago a transportes: subiendo del Excel {len(nuevas)} filas nuevas"
+                + (f" y {len(cambios2)} datos de filas enlazadas" if cambios2 else "") + "...")
+            r2 = pago_web.llamar("pago_sync", {"cambios": cambios2, "nuevas": nuevas, "eliminar": [],
+                                               "restaurar": [], "desde": desde}, timeout=180)
+            for clave in ("conflictos", "errores"):
+                r[clave] = (r.get(clave) or []) + (r2.get(clave) or [])
+            for clave in ("filas", "ids", "nuevas", "cortes_cerrados"):
+                if clave in r2:
+                    r[clave] = r2[clave]
+            cambios = cambios + cambios2
     config = pago_web.cargar_config()
     config["primer_corte"] = primer_corte
     if "catalogos_excel" in pedido:
@@ -1015,6 +1118,9 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
 
     sesion.pausar()
     avisos = []
+    for texto in avisos_vinculo:
+        avisos.append(texto)
+        avisar(texto)
     for c in r.get("conflictos", []):
         if c.get("corte_cerrado"):
             texto = (f"{c.get('fecha_entrega')} {c.get('cod_camion')}: el corte {c['corte_cerrado']} está cerrado; "
@@ -1132,6 +1238,8 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     guardar_foto(foto)
 
     partes = []
+    if vinculos:
+        partes.append(f"{len(vinculos)} filas escritas a mano enlazadas con la web")
     if r.get("nuevas"):
         partes.append(f"{r['nuevas']} filas del Excel subidas")
     if cambios:

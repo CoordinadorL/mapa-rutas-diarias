@@ -600,17 +600,26 @@ def preparar_columna_id(ws):
         ws.Columns(COLUMNA_ID).Hidden = True
 
 
-def _consolidado_agregar(libro: Libro, hoja_nombre: str, filas_origen):
+RE_REF_CONSOLIDADO = re.compile(r"^=\+?'?([^'!]+)'?!\$?([A-Z]+)\$?(\d+)$")
+
+
+def _consolidado_formulas(ws):
+    ultima = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+    return ws.Range(ws.Cells(1, 1), ws.Cells(ultima, ULTIMA_COLUMNA - 1)).Formula
+
+
+def _consolidado_agregar(libro: Libro, hoja_nombre: str, filas_origen, antes_de_fila=None):
     """Agrega al CONSOLIDADO una fila por cada fila de la pestana (formulas
     ='HOJA'!A4 ...), despues de la ultima que ya apunta a esa pestana o, si
-    no hay, despues de la ultima fila que apunta a alguna pestana."""
+    no hay, despues de la ultima fila que apunta a alguna pestana. Con
+    antes_de_fila: despues de la que apunta a la fila de la pestana justo
+    anterior (para que quede en el mismo orden que la pestana)."""
     if not filas_origen or not libro.tiene_hoja(HOJA_CONSOLIDADO):
         return
     ws = libro.hoja(HOJA_CONSOLIDADO)
-    ultima = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
-    formulas = ws.Range(ws.Cells(1, 1), ws.Cells(ultima, ULTIMA_COLUMNA - 1)).Formula
-    re_ref = re.compile(r"^=\+?'?([^'!]+)'?!\$?([A-Z]+)\$?(\d+)$")
-    despues, de_esta = None, None
+    formulas = _consolidado_formulas(ws)
+    re_ref = RE_REF_CONSOLIDADO
+    despues, de_esta, anterior = None, None, None
     patron = None
     for i, fila in enumerate(formulas):
         m = re_ref.match(str(fila[0] or ""))
@@ -620,6 +629,9 @@ def _consolidado_agregar(libro: Libro, hoja_nombre: str, filas_origen):
         patron = fila
         if m.group(1).strip() == hoja_nombre:
             de_esta = i + 1
+            if antes_de_fila is not None and int(m.group(3)) < antes_de_fila:
+                anterior = i + 1
+    de_esta = anterior or de_esta
     ancla = de_esta or despues or FILA_ENCABEZADO
     # Columnas que el CONSOLIDADO trae de cada pestana (todas menos las que
     # se saltean, ej. S). Un CONSOLIDADO vacio (corte nuevo) usa las de siempre.
@@ -661,6 +673,37 @@ def _consolidado_arreglar_sumas(ws):
             ws.Range(f"G{fila}").Formula = f"=SUM(G{PRIMERA_FILA}:G{fila - 1})"
         elif fila_suma is not None and f.startswith("=SUBTOTAL(9,G"):
             ws.Range(f"G{fila}").Formula = f"=SUBTOTAL(9,G{PRIMERA_FILA}:G{fila_suma - 1})"
+
+
+REVISION_CONSOLIDADO = 1
+
+
+def consolidado_completar(libro: Libro, log=print) -> int:
+    """Toda fila con datos de cada pestana de dia tiene que estar en el
+    CONSOLIDADO. Una que se escribio en una fila que el CONSOLIDADO no trae
+    (ej. una fila insertada a mano en la pestana) se agrega en su lugar.
+    Devuelve cuantas se agregaron."""
+    if not libro.hojas or not libro.tiene_hoja(HOJA_CONSOLIDADO):
+        return 0
+    ws = libro.hoja(HOJA_CONSOLIDADO)
+    vistas = set()
+    for fila in _consolidado_formulas(ws):
+        m = RE_REF_CONSOLIDADO.match(str(fila[0] or ""))
+        if m:
+            vistas.add((normalizar(m.group(1)), int(m.group(3))))
+    agregadas = 0
+    for hoja in libro.hojas.values():
+        faltan = [f for f, d in sorted(hoja.filas.items())
+                  if (d["id"] or d["con_datos"]) and (normalizar(hoja.nombre), f) not in vistas]
+        # Una por una, de abajo hacia arriba no hace falta: cada insercion es
+        # en el CONSOLIDADO, no en la pestana (sus filas no se mueven).
+        for f in faltan:
+            _consolidado_agregar(libro, hoja.nombre, [f], antes_de_fila=f)
+            d = hoja.filas[f]["datos"]
+            log(f"Pago a transportes: CONSOLIDADO de {libro.ruta.name}: faltaba {hoja.nombre} fila {f} "
+                f"({d.get('cod_camion') or 'sin camión'}); se agregó.")
+            agregadas += 1
+    return agregadas
 
 
 def crear_archivo_corte(sesion: "SesionExcel", plantilla: Path, corte: dict, log=print) -> Path:
@@ -1001,6 +1044,10 @@ def nada_que_hacer(abrir, foto: dict, primer_corte: str) -> bool:
     OneDrive en un Excel escondido a veces se cuelga esperando a OneDrive)."""
     firmas = foto.get("archivos") or {}
     desde = foto.get("desde")
+    # Una revision nueva del CONSOLIDADO (consolidado_completar) corre una vez
+    # aunque nada haya cambiado.
+    if foto.get("revision_consolidado") != REVISION_CONSOLIDADO:
+        return False
     if not desde or any(firmas.get(a.name) != firma_archivo(a) for a in abrir):
         return False
     if any(abierto_en_excel_usuario(a) for a in abrir):
@@ -1369,6 +1416,13 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
             ubicacion[o["id"]] = (hoja, fila)
     # Filas con ID que la web ya no devuelve (anteriores a "desde"): se dejan como estan.
 
+    # El CONSOLIDADO tiene que traer todas las filas de las pestanas (solo en
+    # los Excel de cortes que se sincronizan; los viejos no se tocan).
+    agregadas_consolidado = 0
+    for libro in libros:
+        if (libro.corte_id or "") >= primer_corte:
+            agregadas_consolidado += consolidado_completar(libro, log)
+
     for libro in libros:
         for hoja in libro.hojas.values():
             preparar_columna_id(hoja.ws)
@@ -1391,6 +1445,7 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     foto["archivos"] = {l.ruta.name: firma_archivo(l.ruta) for l in libros}
     foto["desde"] = desde
     foto["catalogos_firma"] = firma_catalogos(r)
+    foto["revision_consolidado"] = REVISION_CONSOLIDADO
     guardar_foto(foto)
 
     partes = []
@@ -1406,6 +1461,8 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
         partes.append(f"{limpiadas} filas quitadas en la web vaciadas en el Excel")
     if nuevas_hojas:
         partes.append(f"{nuevas_hojas} pestañas nuevas")
+    if agregadas_consolidado:
+        partes.append(f"{agregadas_consolidado} filas que faltaban agregadas al CONSOLIDADO")
     if hechos:
         partes.append(f"{len(hechos)} celdas actualizadas en el Excel")
     if pendientes:

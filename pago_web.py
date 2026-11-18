@@ -137,6 +137,18 @@ def entrega_de(fecha_liq: date) -> date:
     return mymaps.entrega_sugerida(fecha_liq)
 
 
+def facturas_por_vendedor(camion) -> dict:
+    """{vendedor: [N de facturas distintas, $]} de un camion o cargue."""
+    numeros, montos = {}, {}
+    for f in camion["filas"]:
+        v = str(f.get("vendedor") or "").strip().upper()
+        if not v:
+            continue
+        numeros.setdefault(v, set()).update(f.get("_facturas") or ())
+        montos[v] = montos.get(v, 0) + (f.get("Suma de Total") or 0)
+    return {v: [len(numeros[v]), round(montos.get(v, 0), 2)] for v in numeros}
+
+
 def resumen_del_dia(seleccion, fechas) -> dict:
     """Lo que se manda por camion (o por cargue, si va separado)."""
     fecha_liq = max(fechas)
@@ -155,6 +167,10 @@ def resumen_del_dia(seleccion, fechas) -> dict:
             # vacio (para escribirlo a mano) en vez de mandar 0.
             "facturas": c.get("facturas", 0) if con_facturas else "",
             "monto": round(c.get("total") or 0, 2),
+            # Facturas y $ de cada vendedor del cargue: con la linea de cada
+            # vendedor (BASE DE TRANSPORTISTAS, columna D) la web pone la LINEA
+            # del dia = la que tiene mas facturas.
+            "facturas_por_vendedor": facturas_por_vendedor(c) if con_facturas else {},
         })
     return {"fecha_liq": fecha_liq.isoformat(), "fecha_entrega": entrega_de(fecha_liq).isoformat(),
             "camiones": camiones}

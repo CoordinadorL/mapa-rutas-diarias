@@ -36,7 +36,7 @@ import generar_rutas as gr
 import mymaps
 
 PUERTO = 5178
-VERSION = "7"
+VERSION = "8"
 ORIGENES_PERMITIDOS = {
     "https://coordinadorl.github.io",
     "http://localhost:8080",        # pruebas de la app en esta PC
@@ -1751,16 +1751,19 @@ class PagoTransportes(Controlador):
         self.sincronizar_ahora()
         return {"ok": True}
 
-    def sincronizar_ahora(self, _=None):
+    def sincronizar_ahora(self, cuerpo=None):
+        # Desde la pagina (boton): vuelta completa aunque nada haya cambiado,
+        # que tambien revisa el CONSOLIDADO.
+        forzar = bool((cuerpo or {}).get("forzar"))
         if not self.sincronizando:
-            threading.Thread(target=self._sincronizar, daemon=True).start()
+            threading.Thread(target=self._sincronizar, args=(forzar,), daemon=True).start()
         return {"ok": True}
 
     def limpiar_avisos(self, _=None):
         self.avisos_sync = []
         return {"ok": True}
 
-    def _sincronizar(self):
+    def _sincronizar(self, forzar=False):
         import pago_web
         with self.lock:
             if self.sincronizando:
@@ -1773,7 +1776,7 @@ class PagoTransportes(Controlador):
             if not pago_web.tiene_clave():
                 return
             import pago_excel
-            r = pago_excel.sincronizar(self.log)
+            r = pago_excel.sincronizar(self.log, forzar=forzar)
             self.ultima = {"hora": ahora(), "ok": bool(r.get("ok")), "mensaje": r.get("mensaje", ""),
                            "archivo": r.get("archivo"), "corte": r.get("corte")}
             if r.get("avisos"):

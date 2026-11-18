@@ -656,54 +656,138 @@ def _consolidado_agregar(libro: Libro, hoja_nombre: str, filas_origen, antes_de_
     libro.modificado = True
 
 
-def _consolidado_arreglar_sumas(ws):
-    """Las sumas de abajo del CONSOLIDADO (=SUM(G4:G...) y =SUBTOTAL(9,G4:G...))
-    tienen que abarcar todas las filas: al insertar justo al principio o al
-    final del rango, Excel no las estira solo."""
-    ultima = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
-    formulas = ws.Range(ws.Cells(PRIMERA_FILA, 7), ws.Cells(max(ultima, PRIMERA_FILA), 7)).Formula
+def col_letra(n: int) -> str:
+    letras = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        letras = chr(65 + r) + letras
+    return letras
+
+
+def _consolidado_fila_suma(ws):
+    """Primera fila de las sumas de abajo del CONSOLIDADO (=SUM( en VALOR DE
+    RUTA o en VALOR A CANCELAR), o None."""
+    ultima = max(ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1, PRIMERA_FILA)
+    formulas = ws.Range(ws.Cells(PRIMERA_FILA, 7), ws.Cells(ultima, 19)).Formula
     if not isinstance(formulas, tuple):
         formulas = ((formulas,),)
-    fila_suma = None
-    for i, (f,) in enumerate(formulas):
-        f = str(f or "").replace(" ", "").upper()
-        fila = PRIMERA_FILA + i
-        if fila_suma is None and f.startswith("=SUM(G"):
-            fila_suma = fila
-            ws.Range(f"G{fila}").Formula = f"=SUM(G{PRIMERA_FILA}:G{fila - 1})"
-        elif fila_suma is not None and f.startswith("=SUBTOTAL(9,G"):
-            ws.Range(f"G{fila}").Formula = f"=SUBTOTAL(9,G{PRIMERA_FILA}:G{fila_suma - 1})"
+    for i, fila in enumerate(formulas):
+        if any(str(f or "").replace(" ", "").upper().startswith("=SUM(") for f in (fila[0], fila[-1])):
+            return PRIMERA_FILA + i
+    return None
 
 
-REVISION_CONSOLIDADO = 1
+def _consolidado_arreglar_sumas(ws) -> bool:
+    """Las sumas de abajo del CONSOLIDADO (=SUM(G4:G...), =SUM(S4:S...) y sus
+    =SUBTOTAL(9,...)) tienen que abarcar todas las filas, de la 4 a la de
+    arriba de las sumas: al insertar o borrar filas en el borde del rango,
+    Excel no las estira solo. Devuelve True si cambio alguna."""
+    fila_suma = _consolidado_fila_suma(ws)
+    if fila_suma is None:
+        return False
+    ultima = max(ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1, fila_suma)
+    formulas = ws.Range(ws.Cells(fila_suma, 1), ws.Cells(ultima, ULTIMA_COLUMNA - 1)).Formula
+    if not isinstance(formulas[0], tuple):
+        formulas = (formulas,)
+    cambio = False
+    for i, fila in enumerate(formulas):
+        for j, f in enumerate(fila):
+            letra = col_letra(j + 1)
+            t = str(f or "").replace(" ", "").upper()
+            if re.match(rf"^=SUM\({letra}\d+:{letra}\d+\)$", t):
+                deseada = f"=SUM({letra}{PRIMERA_FILA}:{letra}{fila_suma - 1})"
+            elif re.match(rf"^=SUBTOTAL\(9,{letra}\d+:{letra}\d+\)$", t):
+                deseada = f"=SUBTOTAL(9,{letra}{PRIMERA_FILA}:{letra}{fila_suma - 1})"
+            else:
+                continue
+            if t != deseada.upper():
+                ws.Cells(fila_suma + i, j + 1).Formula = deseada
+                cambio = True
+    return cambio
 
 
-def consolidado_completar(libro: Libro, log=print) -> int:
-    """Toda fila con datos de cada pestana de dia tiene que estar en el
-    CONSOLIDADO. Una que se escribio en una fila que el CONSOLIDADO no trae
-    (ej. una fila insertada a mano en la pestana) se agrega en su lugar.
-    Devuelve cuantas se agregaron."""
+# Subir este numero hace que la proxima vuelta revise el CONSOLIDADO aunque
+# nada haya cambiado (ver nada_que_hacer).
+REVISION_CONSOLIDADO = 2
+
+
+def consolidado_verificar(libro: Libro, log=print):
+    """El CONSOLIDADO tiene que traer exactamente las filas con datos de las
+    pestanas de dia, en orden de fecha y de fila: ni una de menos (fila
+    insertada o camion agregado a mano), ni una de mas (camion eliminado,
+    fila vaciada, repetida o con #REF! porque se borro la fila o la pestana).
+    Si no cuadra, se vuelve a armar entero (solo el bloque de filas: las
+    sumas de abajo quedan y se ajustan). Devuelve un resumen o None."""
     if not libro.hojas or not libro.tiene_hoja(HOJA_CONSOLIDADO):
-        return 0
+        return None
     ws = libro.hoja(HOJA_CONSOLIDADO)
-    vistas = set()
-    for fila in _consolidado_formulas(ws):
-        m = RE_REF_CONSOLIDADO.match(str(fila[0] or ""))
+    fila_suma = _consolidado_fila_suma(ws)
+    if fila_suma is None:
+        avisar(f"El CONSOLIDADO de {libro.ruta.name} no tiene la fila de las sumas (=SUM): no se revisó.")
+        return None
+    hojas = sorted(libro.hojas.values(), key=lambda h: (h.fecha or date.max, normalizar(h.nombre)))
+    esperado = [(h.nombre, f) for h in hojas for f, d in sorted(h.filas.items()) if d["id"] or d["con_datos"]]
+    clave = lambda x: (normalizar(x[0]), x[1])
+    n_bloque = fila_suma - PRIMERA_FILA
+    actual, rotas, patron = [], 0, None
+    if n_bloque > 0:
+        formulas = ws.Range(ws.Cells(PRIMERA_FILA, 1), ws.Cells(fila_suma - 1, ULTIMA_COLUMNA - 1)).Formula
+        if not isinstance(formulas[0], tuple):
+            formulas = (formulas,)
+        for fila in formulas:
+            a = str(fila[0] or "")
+            m = RE_REF_CONSOLIDADO.match(a)
+            if m:
+                actual.append((m.group(1).strip(), int(m.group(3))))
+                patron = patron or fila
+            elif "#REF" in a.upper():
+                rotas += 1
+    if [clave(x) for x in actual] == [clave(x) for x in esperado] and not rotas:
+        if _consolidado_arreglar_sumas(ws):
+            libro.modificado = True
+            log(f"Pago a transportes: sumas del CONSOLIDADO de {libro.ruta.name} corregidas.")
+            return {"filas": len(esperado), "reconstruido": False, "sumas": True}
+        return {"filas": len(esperado), "reconstruido": False}
+    if not esperado:
+        return None             # sin dias con datos: no se toca
+    esperados = {clave(x) for x in esperado}
+    vistos = [clave(x) for x in actual]
+    faltaban = len(esperados - set(vistos))
+    sobraban = sum(1 for x in vistos if x not in esperados) + (len(vistos) - len(set(vistos))) + rotas
+    # Columnas que trae de cada pestana (las de una fila que ya estaba bien;
+    # si no hay, todas de A a V).
+    columnas = []
+    for j, f in enumerate(patron or ()):
+        m = RE_REF_CONSOLIDADO.match(str(f or ""))
         if m:
-            vistas.add((normalizar(m.group(1)), int(m.group(3))))
-    agregadas = 0
-    for hoja in libro.hojas.values():
-        faltan = [f for f, d in sorted(hoja.filas.items())
-                  if (d["id"] or d["con_datos"]) and (normalizar(hoja.nombre), f) not in vistas]
-        # Una por una, de abajo hacia arriba no hace falta: cada insercion es
-        # en el CONSOLIDADO, no en la pestana (sus filas no se mueven).
-        for f in faltan:
-            _consolidado_agregar(libro, hoja.nombre, [f], antes_de_fila=f)
-            d = hoja.filas[f]["datos"]
-            log(f"Pago a transportes: CONSOLIDADO de {libro.ruta.name}: faltaba {hoja.nombre} fila {f} "
-                f"({d.get('cod_camion') or 'sin camión'}); se agregó.")
-            agregadas += 1
-    return agregadas
+            columnas.append((j, m.group(2)))
+    if not columnas:
+        columnas = [(col_num(l) - 1, l) for l in "ABCDEFGHIJKLMNOPQRSTUV"]
+    ancho = ULTIMA_COLUMNA - 1
+    n = len(esperado)
+    # El bloque queda con n filas. Se inserta o se borra DENTRO del bloque,
+    # para que las sumas de abajo sigan abarcandolo.
+    if n_bloque < n:
+        donde = fila_suma - 1 if n_bloque else fila_suma
+        ws.Range(ws.Rows(donde), ws.Rows(donde + (n - n_bloque) - 1)).Insert()
+    elif n_bloque > n:
+        ws.Range(ws.Rows(PRIMERA_FILA), ws.Rows(PRIMERA_FILA + (n_bloque - n) - 1)).Delete()
+    filas = []
+    for hoja_nombre, fila_origen in esperado:
+        fila = [""] * ancho
+        for j, letra in columnas:
+            if j < ancho:
+                fila[j] = f"=+'{hoja_nombre}'!{letra}{fila_origen}"
+        filas.append(tuple(fila))
+    ws.Range(ws.Cells(PRIMERA_FILA, 1), ws.Cells(PRIMERA_FILA + n - 1, ancho)).Formula = tuple(filas)
+    _consolidado_arreglar_sumas(ws)
+    libro.modificado = True
+    texto = (f"CONSOLIDADO de {libro.ruta.name} rearmado: {n} filas"
+             + (f", faltaban {faltaban}" if faltaban else "")
+             + (f", sobraban o estaban rotas {sobraban}" if sobraban else "") + ".")
+    log("Pago a transportes: " + texto)
+    avisar(texto)
+    return {"filas": n, "reconstruido": True, "faltaban": faltaban, "sobraban": sobraban}
 
 
 def crear_archivo_corte(sesion: "SesionExcel", plantilla: Path, corte: dict, log=print) -> Path:
@@ -907,8 +991,13 @@ def escribir_catalogos(libro: Libro, cat: dict, fecha: date = None):
                 libro.modificado = True
     if libro.tiene_hoja(HOJA_TRANSPORTISTAS) and cat.get("transportistas"):
         ws = wb.Worksheets(HOJA_TRANSPORTISTAS)
+        extra = columnas_extra_transportistas(ws)       # {campo: columna} de AJUSTE / LINEA
+        # Solo si la web ya maneja esos datos (un backend viejo no los manda:
+        # escribirlos vacios borraria lo que hay en el Excel).
+        extra = {c: col for c, col in extra.items() if any(c in t for t in cat["transportistas"])}
+        ancho = max([2] + list(extra.values()))
         ultima = max(ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1, 2)
-        valores = ws.Range(ws.Cells(2, 1), ws.Cells(ultima, 2)).Value
+        valores = ws.Range(ws.Cells(2, 1), ws.Cells(ultima, ancho)).Value
         filas = {str(v[0] or "").strip().upper(): (2 + i, v) for i, v in enumerate(valores) if v[0]}
         siguiente = 2 + max((i for i, v in enumerate(valores) if v[0]), default=-1) + 1
         for t in cat["transportistas"]:
@@ -922,10 +1011,55 @@ def escribir_catalogos(libro: Libro, cat: dict, fecha: date = None):
                     ws.Cells(fila, 2).Value = nombre
                     libro.modificado = True
             else:
-                ws.Cells(siguiente, 1).Value = tag
-                ws.Cells(siguiente, 2).Value = nombre
+                fila, v = siguiente, None
+                ws.Cells(fila, 1).Value = tag
+                ws.Cells(fila, 2).Value = nombre
                 siguiente += 1
                 libro.modificado = True
+            for campo, col in extra.items():
+                deseado = norm(campo, t.get(campo))
+                if v is None or not iguales(norm(campo, v[col - 1]), deseado):
+                    if v is None and deseado == "":
+                        continue
+                    ws.Cells(fila, col).Value = None if deseado == "" else (
+                        int(deseado) if campo == "ajuste" and isinstance(deseado, float) else deseado)
+                    libro.modificado = True
+
+
+def columnas_extra_transportistas(ws) -> dict:
+    """Columnas AJUSTE y LINEA de BASE DE TRANSPORTISTAS (por su encabezado
+    en la fila 1; si el Excel no las tiene, {})."""
+    encabezado = ws.Range(ws.Cells(1, 1), ws.Cells(1, 12)).Value[0]
+    cols = {}
+    for i, h in enumerate(encabezado):
+        n = normalizar(h)
+        if n == "AJUSTE":
+            cols["ajuste"] = i + 1
+        elif n in ("LINEA", "LINEA DEL VENDEDOR"):
+            cols["linea"] = i + 1
+    return cols
+
+
+def transportistas_del_excel(libro: Libro) -> dict:
+    """{TAG: {"nombre", "ajuste", "linea"}} de BASE DE TRANSPORTISTAS (solo si
+    tiene las columnas AJUSTE / LINEA)."""
+    if not libro.tiene_hoja(HOJA_TRANSPORTISTAS):
+        return {}
+    ws = libro.hoja(HOJA_TRANSPORTISTAS)
+    extra = columnas_extra_transportistas(ws)
+    if not extra:
+        return {}
+    ancho = max([2] + list(extra.values()))
+    ultima = max(ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1, 2)
+    res = {}
+    for v in ws.Range(ws.Cells(2, 1), ws.Cells(ultima, ancho)).Value:
+        tag = str(v[0] or "").strip().upper()
+        if tag:
+            d = {"nombre": str(v[1] or "").strip()}
+            for campo, col in extra.items():
+                d[campo] = norm(campo, v[col - 1])
+            res[tag] = d
+    return res
 
 
 def catalogos_del_excel(libro: Libro) -> dict:
@@ -1044,7 +1178,7 @@ def nada_que_hacer(abrir, foto: dict, primer_corte: str) -> bool:
     OneDrive en un Excel escondido a veces se cuelga esperando a OneDrive)."""
     firmas = foto.get("archivos") or {}
     desde = foto.get("desde")
-    # Una revision nueva del CONSOLIDADO (consolidado_completar) corre una vez
+    # Una revision nueva del CONSOLIDADO (consolidado_verificar) corre una vez
     # aunque nada haya cambiado.
     if foto.get("revision_consolidado") != REVISION_CONSOLIDADO:
         return False
@@ -1092,7 +1226,7 @@ def guardar_foto(foto: dict) -> None:
     temporal.replace(ARCHIVO_FOTO)
 
 
-def sincronizar(log=print, carpeta=None) -> dict:
+def sincronizar(log=print, carpeta=None, forzar=False) -> dict:
     """Una vuelta completa. Devuelve {"ok", "mensaje", "avisos"}; los errores
     esperables salen como ErrorPago."""
     if not _BLOQUEO.acquire(blocking=False):
@@ -1110,7 +1244,7 @@ def sincronizar(log=print, carpeta=None) -> dict:
     except OSError:
         foto_antes = None
     try:
-        return _sincronizar(sesion, log, carpeta)
+        return _sincronizar(sesion, log, carpeta, forzar)
     except pythoncom.com_error as e:
         if _es_excel_ocupado(e):
             raise ErrorPago(EXCEL_OCUPADO)
@@ -1141,7 +1275,7 @@ def sincronizar(log=print, carpeta=None) -> dict:
             _BLOQUEO.release()
 
 
-def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
+def _sincronizar(sesion: SesionExcel, log, carpeta, forzar=False) -> dict:
     todos = archivos_bimestrales(carpeta)
     if not todos:
         raise ErrorPago("No encontré el Excel CAMIONES-AYUDANTES-FRECUENCIAS en la carpeta "
@@ -1170,7 +1304,7 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
              if c["id"] in por_corte and c["id"] >= primer_corte and c["id"] not in cerrados]
     abrir += [a for a in todos if a.name in con_filas and a not in abrir and corte_de_archivo(a) not in cerrados]
     pendientes = pago_web.enviar_pendientes(log)
-    if abrir and nada_que_hacer(abrir, foto, primer_corte):
+    if abrir and not forzar and nada_que_hacer(abrir, foto, primer_corte):
         mensaje = (f"Sincronizado: sin cambios ({pendientes} días sin enviar todavía)." if pendientes
                    else "Sincronizado: sin cambios.")
         log("Pago a transportes: " + mensaje)
@@ -1266,6 +1400,24 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     # Las filas nuevas del Excel van en un segundo paso: antes se buscan en lo
     # que ya tiene la web (ver emparejar_con_web).
     pedido = {"cambios": cambios, "nuevas": [], "eliminar": eliminar, "restaurar": restaurar, "desde": desde}
+    # AJUSTE y LINEA de BASE DE TRANSPORTISTAS (Excel del corte actual): lo que
+    # cambio desde la ultima vez sube a la web. La primera vez se sube todo.
+    libro_actual = next((l for l in libros if l.corte_id == actual["id"]), None)
+    transp_excel = transportistas_del_excel(libro_actual) if libro_actual else {}
+    foto_transp = foto.get("transp") or {}
+    cambios_transp = []
+    for tag, d in transp_excel.items():
+        for campo in ("ajuste", "linea"):
+            if campo not in d:
+                continue
+            antes = (foto_transp.get(tag) or {}).get(campo, "")
+            if not iguales(d[campo], antes):
+                cambios_transp.append({"tag": tag, "nombre": d.get("nombre", ""), "campo": campo,
+                                       "valor": d[campo], "base": antes})
+    if cambios_transp:
+        pedido["transportistas_cambios"] = cambios_transp
+        log(f"Pago a transportes: {len(cambios_transp)} datos de AJUSTE / LINEA de BASE DE TRANSPORTISTAS "
+            f"cambiados en el Excel...")
     if not config.get("catalogos_subidos") and libros:
         pedido["catalogos_excel"] = catalogos_del_excel(libros[0])
     if cambios or eliminar:
@@ -1317,6 +1469,11 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
     sesion.pausar()
     avisos = []
     for texto in avisos_previos + avisos_vinculo:
+        avisos.append(texto)
+        avisar(texto)
+    for c in r.get("conflictos_transportistas", []):
+        texto = (f"BASE DE TRANSPORTISTAS {c.get('tag')}: en el Excel se puso \"{c.get('valor_excel')}\" en "
+                 f"{c.get('campo')}, pero en la web ya estaba \"{c.get('valor_web')}\". Se dejó el de la web.")
         avisos.append(texto)
         avisar(texto)
     for c in r.get("conflictos", []):
@@ -1418,10 +1575,12 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
 
     # El CONSOLIDADO tiene que traer todas las filas de las pestanas (solo en
     # los Excel de cortes que se sincronizan; los viejos no se tocan).
-    agregadas_consolidado = 0
+    revision_consolidado = []
     for libro in libros:
         if (libro.corte_id or "") >= primer_corte:
-            agregadas_consolidado += consolidado_completar(libro, log)
+            res = consolidado_verificar(libro, log)
+            if res:
+                revision_consolidado.append(res)
 
     for libro in libros:
         for hoja in libro.hojas.values():
@@ -1433,6 +1592,13 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
         # Una sola tarifa por COD en el Excel: la que rige hoy (o desde el
         # inicio del corte, si se programo un cambio para el corte nuevo).
         escribir_catalogos(activo, r, max(hoy, actual["desde"]))
+        # Lo que quedo escrito en BASE DE TRANSPORTISTAS (= la web), para ver
+        # en la proxima vuelta que cambio en el Excel.
+        if (activo.tiene_hoja(HOJA_TRANSPORTISTAS) and columnas_extra_transportistas(activo.hoja(HOJA_TRANSPORTISTAS))
+                and any("ajuste" in t or "linea" in t for t in (r.get("transportistas") or []))):
+            foto["transp"] = {str(t.get("tag") or "").strip().upper(): {"ajuste": norm("ajuste", t.get("ajuste")),
+                                                                       "linea": norm("linea", t.get("linea"))}
+                              for t in (r.get("transportistas") or []) if t.get("tag")}
     sesion.reanudar()       # calculo automatico otra vez (recalcula antes de guardar)
     # RESUMEN no se toca: refrescar sus tablas dinamicas por programa las
     # agranda encima de la tabla de detalle de al lado (Excel no pregunta con
@@ -1461,8 +1627,11 @@ def _sincronizar(sesion: SesionExcel, log, carpeta) -> dict:
         partes.append(f"{limpiadas} filas quitadas en la web vaciadas en el Excel")
     if nuevas_hojas:
         partes.append(f"{nuevas_hojas} pestañas nuevas")
-    if agregadas_consolidado:
-        partes.append(f"{agregadas_consolidado} filas que faltaban agregadas al CONSOLIDADO")
+    rearmados = [x for x in revision_consolidado if x.get("reconstruido")]
+    if rearmados:
+        partes.append(f"CONSOLIDADO rearmado ({sum(x['filas'] for x in rearmados)} filas)")
+    elif forzar and revision_consolidado:
+        partes.append(f"CONSOLIDADO revisado: cuadra ({sum(x['filas'] for x in revision_consolidado)} filas)")
     if hechos:
         partes.append(f"{len(hechos)} celdas actualizadas en el Excel")
     if pendientes:

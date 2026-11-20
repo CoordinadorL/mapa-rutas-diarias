@@ -1355,11 +1355,18 @@ def _sincronizar(sesion: SesionExcel, log, carpeta, forzar=False) -> dict:
                             datos["fecha_entrega"] = hoja.fecha.isoformat()
                         restaurar.append({"id": f["id"], "datos": datos})
                 elif f["con_datos"] and (libro.corte_id or "") >= primer_corte:
-                    tmp = f"XLS|{hoja.nombre}|{fila}"
                     datos = dict(f["datos"])
                     if not datos.get("fecha_entrega") and hoja.fecha:
                         datos["fecha_entrega"] = hoja.fecha.isoformat()
                     firma = json.dumps(datos, sort_keys=True, default=str)
+                    # La clave lleva la huella de los datos, no solo el lugar:
+                    # con "XLS|pestana|fila" a secas la web devolvia el ID de la
+                    # fila que estuvo antes en ese lugar (otro camion) y el Excel
+                    # le escribia encima esos datos (paso 17..19-11 en LNS16-11:
+                    # el FO52 agregado a mano se perdio tres veces). Con la
+                    # huella solo se reconoce la MISMA fila (sync cortada antes
+                    # de escribir el ID).
+                    tmp = f"XLS|{hoja.nombre}|{fila}|{hashlib.md5(firma.encode('utf-8')).hexdigest()[:10]}"
                     vistas.add(tmp)
                     # Una fila que la web ya rechazo (ej. corte cerrado) no se
                     # vuelve a mandar mientras no cambie.
@@ -1492,10 +1499,28 @@ def _sincronizar(sesion: SesionExcel, log, carpeta, forzar=False) -> dict:
         avisos.append(texto)
         avisar(texto)
 
-    # IDs de las filas nuevas (escribir_fila los anota en la columna W).
+    # IDs de las filas nuevas (escribir_fila los anota en la columna W). Si la
+    # web devuelve un ID que ya tiene OTRA fila del Excel, no se usa: esa fila
+    # se pisaria con los datos de la otra (y quedaria el ID repetido).
+    reintentar = False      # quedo una fila sin ID: la proxima vuelta abre el Excel
     for tmp, ident in (r.get("ids") or {}).items():
-        if tmp in por_tmp:
-            ubicacion[ident] = por_tmp[tmp][:2]
+        if tmp not in por_tmp:
+            continue
+        lugar = por_tmp[tmp][:2]
+        if ident in ubicacion and ubicacion[ident] != lugar:
+            hoja_o, fila_o = ubicacion[ident]
+            texto = (f"{lugar[0].nombre} fila {lugar[1]}: la web la reconoció como la fila {fila_o} de "
+                     f"{hoja_o.nombre}. No se tocó; avísale a soporte si sigue saliendo este aviso.")
+            avisos.append(texto)
+            avisar(texto)
+            # Sin el ID copiado: queda como fila sin ID (no pasa a ser la otra
+            # si algun dia se borra la original).
+            if str(lugar[0].ws.Range(f"{COLUMNA_ID}{lugar[1]}").Value or "").strip():
+                _escribir(lugar[0].ws, lugar[1], COLUMNA_ID, None)
+                lugar[0].libro.modificado = True
+            reintentar = True
+            continue
+        ubicacion[ident] = lugar
 
     # 2) web -> Excel
     hechos = []
@@ -1608,7 +1633,7 @@ def _sincronizar(sesion: SesionExcel, log, carpeta, forzar=False) -> dict:
             sesion.guardar(libro.wb)
     # Como quedaron los archivos y la web: si en la proxima vuelta nada de
     # esto cambio, no hace falta abrir Excel (ver nada_que_hacer).
-    foto["archivos"] = {l.ruta.name: firma_archivo(l.ruta) for l in libros}
+    foto["archivos"] = {} if reintentar else {l.ruta.name: firma_archivo(l.ruta) for l in libros}
     foto["desde"] = desde
     foto["catalogos_firma"] = firma_catalogos(r)
     foto["revision_consolidado"] = REVISION_CONSOLIDADO
